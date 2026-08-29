@@ -16,7 +16,7 @@
   its real backend but forgets to update this line will have every API
   call silently blocked by this CSP. See docs/deployment.md.
 -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://localhost:8000 http://127.0.0.1:8000; object-src 'none'; base-uri 'self'; form-action 'self';" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://ai-receptionist-production-4aa1.up.railway.app; object-src 'none'; base-uri 'self'; form-action 'self';" />
 <title>AI Receptionist — Dashboard</title>
 <link rel="stylesheet" href="css/reset.css" />
 <link rel="stylesheet" href="css/dashboard.css" />

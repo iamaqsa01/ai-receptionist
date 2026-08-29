@@ -12,5 +12,5 @@
  * and add the frontend's deployed origin to the backend's CORS_ORIGINS.
  */
 window.__AI_RECEPTIONIST_CONFIG__ = {
-  API_BASE_URL: "http://localhost:8000/api/v1",
+  API_BASE_URL: "https://ai-receptionist-production-4aa1.up.railway.app/api/v1",
 };
