@@ -1,0 +1,254 @@
+/* ==========================================================================
+   AI Receptionist — Multi-step onboarding wizard (Phase 2)
+   Vanilla CSS, no build step. Reuses the design tokens declared in
+   css/dashboard.css (--brand, --surface, --border, --text*, --radius-*,
+   --shadow-*, …) so light/dark theming already works with no extra rules.
+   ========================================================================== */
+
+.onboard-screen {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  background:
+    radial-gradient(1200px 600px at 12% -10%, var(--brand-soft), transparent 60%),
+    radial-gradient(900px 500px at 112% 8%, var(--info-soft), transparent 55%),
+    var(--bg);
+  overflow: hidden;
+}
+.onboard-screen[hidden] { display: none !important; }
+
+/* -- Top bar ------------------------------------------------------------- */
+.onboard-topbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 28px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elevated);
+}
+.onboard-brand { display: flex; align-items: center; gap: 10px; font-weight: 700; }
+.onboard-brand__mark {
+  width: 30px; height: 30px; border-radius: 9px;
+  display: grid; place-items: center;
+  background: var(--brand); color: #fff; font-size: 12px; letter-spacing: .5px;
+}
+.onboard-brand__name { font-size: 14.5px; }
+.onboard-brand__ws {
+  font-size: 12px; font-weight: 600;
+  padding: 3px 9px; border-radius: 999px;
+  background: var(--brand-soft); color: var(--brand);
+  max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+@media (max-width: 640px) { .onboard-brand__ws { display: none; } }
+.onboard-topbar__meta { display: flex; align-items: center; gap: 14px; }
+.onboard-topbar__step {
+  font-size: 12.5px; color: var(--text-muted);
+}
+.onboard-topbar__progress {
+  width: 160px; height: 6px; border-radius: 999px;
+  background: var(--bg-subtle); overflow: hidden;
+}
+.onboard-topbar__progress > span {
+  display: block; height: 100%; border-radius: 999px;
+  background: var(--brand); transition: width .25s var(--ease);
+}
+
+/* -- Body: stepper rail + step content --------------------------------- */
+.onboard-body {
+  flex: 1 1 auto;
+  display: grid;
+  grid-template-columns: 264px 1fr;
+  min-height: 0;
+}
+
+.onboard-rail {
+  border-right: 1px solid var(--border);
+  padding: 24px 16px;
+  overflow-y: auto;
+  background: var(--bg-elevated);
+}
+.onboard-rail__title {
+  font-size: 11px; text-transform: uppercase; letter-spacing: .8px;
+  color: var(--text-faint); font-weight: 700; padding: 0 10px 10px;
+}
+.onboard-step-btn {
+  width: 100%;
+  display: flex; align-items: center; gap: 11px;
+  padding: 10px 10px;
+  border: none; background: transparent;
+  border-radius: var(--radius-sm);
+  text-align: left; cursor: pointer;
+  color: var(--text-muted);
+  font-size: 13px;
+  transition: background .15s var(--ease), color .15s var(--ease);
+}
+.onboard-step-btn:hover:not(:disabled) { background: var(--surface-hover); color: var(--text); }
+.onboard-step-btn:disabled { cursor: not-allowed; opacity: .55; }
+.onboard-step-btn.is-active { background: var(--brand-soft); color: var(--brand); font-weight: 600; }
+.onboard-step-btn__num {
+  flex: 0 0 auto;
+  width: 22px; height: 22px; border-radius: 999px;
+  display: grid; place-items: center;
+  font-size: 11.5px; font-weight: 700;
+  background: var(--bg-subtle); color: var(--text-muted);
+  border: 1px solid var(--border);
+}
+.onboard-step-btn.is-active .onboard-step-btn__num { background: var(--brand); color: #fff; border-color: var(--brand); }
+.onboard-step-btn.is-done .onboard-step-btn__num { background: var(--success); color: #fff; border-color: var(--success); }
+.onboard-step-btn.is-done { color: var(--text); }
+
+/* -- Step content ----------------------------------------------------- */
+.onboard-content {
+  overflow-y: auto;
+  min-height: 0; /* let it actually scroll inside the grid/flex cell */
+  padding: 32px clamp(20px, 5vw, 64px) 120px;
+}
+.onboard-content__inner { max-width: 780px; margin: 0 auto; }
+
+.onboard-step-head { margin-bottom: 22px; }
+.onboard-step-head__eyebrow {
+  font-size: 11.5px; font-weight: 700; letter-spacing: .6px;
+  text-transform: uppercase; color: var(--brand);
+}
+.onboard-step-head__title { font-size: 22px; font-weight: 750; margin: 6px 0 6px; }
+.onboard-step-head__sub { font-size: 13.5px; color: var(--text-muted); }
+
+.onboard-error {
+  display: none;
+  margin-bottom: 18px;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: var(--danger-soft);
+  border: 1px solid var(--danger);
+  color: var(--danger);
+  font-size: 13px;
+}
+.onboard-error.is-visible { display: block; }
+
+.onboard-fieldset { margin-bottom: 26px; }
+.onboard-fieldset__legend {
+  font-size: 13px; font-weight: 700; margin-bottom: 12px;
+  padding-bottom: 8px; border-bottom: 1px solid var(--border);
+}
+
+.onboard-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px 16px; }
+.onboard-grid .span-2 { grid-column: 1 / -1; }
+@media (max-width: 640px) { .onboard-grid { grid-template-columns: 1fr; } }
+
+.onboard-hint { font-size: 11.5px; color: var(--text-faint); margin-top: 5px; }
+.onboard-count { font-size: 11px; color: var(--text-faint); margin-top: 5px; text-align: right; }
+.onboard-count.is-over { color: var(--danger); font-weight: 600; }
+
+/* -- Repeatable rows (doctors / services / FAQs / payment methods) --- */
+.onboard-repeat-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 16px;
+  margin-bottom: 14px;
+  background: var(--surface);
+}
+.onboard-repeat-card__head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 12px;
+}
+.onboard-repeat-card__title { font-size: 12.5px; font-weight: 700; color: var(--text-muted); }
+
+.onboard-inline-row {
+  display: flex; gap: 10px; align-items: flex-end; margin-bottom: 10px;
+}
+.onboard-inline-row > .field { flex: 1; }
+
+.onboard-daypick { display: flex; flex-wrap: wrap; gap: 6px; }
+.onboard-daypick label {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 10px; border: 1px solid var(--border); border-radius: 999px;
+  font-size: 12px; cursor: pointer; user-select: none;
+  color: var(--text-muted);
+}
+.onboard-daypick label:has(input:checked) {
+  background: var(--brand-soft); border-color: var(--brand); color: var(--brand); font-weight: 600;
+}
+.onboard-daypick input { accent-color: var(--brand); }
+
+.onboard-add-btn { margin-top: 4px; }
+
+/* -- Review -------------------------------------------------------------- */
+.onboard-review-section {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  margin-bottom: 14px;
+  overflow: hidden;
+  background: var(--surface);
+}
+.onboard-review-section__head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px;
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+}
+.onboard-review-section__title { font-size: 13px; font-weight: 700; }
+.onboard-review-section__body { padding: 14px 16px; }
+.onboard-review-row {
+  display: grid; grid-template-columns: 190px 1fr; gap: 10px;
+  padding: 6px 0; font-size: 13px;
+}
+.onboard-review-row dt { color: var(--text-muted); }
+.onboard-review-row dd { color: var(--text); word-break: break-word; }
+.onboard-review-row dd.is-empty { color: var(--text-faint); font-style: italic; }
+@media (max-width: 640px) { .onboard-review-row { grid-template-columns: 1fr; gap: 2px; } }
+
+.onboard-review-list { margin: 4px 0 0; padding-left: 18px; font-size: 13px; }
+.onboard-review-list li { margin: 3px 0; }
+
+.onboard-payload {
+  margin-top: 16px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-sm);
+}
+.onboard-payload > summary {
+  cursor: pointer; padding: 10px 14px; font-size: 12px; color: var(--text-muted);
+}
+.onboard-payload pre {
+  margin: 0; padding: 12px 14px; border-top: 1px solid var(--border);
+  font-size: 11.5px; line-height: 1.5;
+  overflow-x: auto; color: var(--text-muted);
+  background: var(--bg-subtle);
+}
+
+/* -- Sticky footer ---------------------------------------------------- */
+.onboard-footer {
+  position: absolute;
+  left: 264px; right: 0; bottom: 0;
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px;
+  padding: 14px clamp(20px, 5vw, 64px);
+  border-top: 1px solid var(--border);
+  background: var(--bg-elevated);
+}
+.onboard-footer__spacer { flex: 1; }
+@media (max-width: 860px) {
+  /* Stack the rail above the content, and give the content row the
+     remaining height so it (not the whole page) scrolls. */
+  .onboard-body { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); }
+  .onboard-rail {
+    grid-row: 1;
+    border-right: none; border-bottom: 1px solid var(--border);
+    display: flex; gap: 6px; overflow-x: auto; overflow-y: hidden; padding: 12px;
+    flex: 0 0 auto;
+  }
+  .onboard-rail__title { display: none; }
+  .onboard-step-btn { width: auto; white-space: nowrap; flex: 0 0 auto; }
+  .onboard-step-btn__label { display: none; }
+  .onboard-content { padding-bottom: 96px; }
+  .onboard-footer { left: 0; }
+}
+
+/* -- Loading state ---------------------------------------------------- */
+.onboard-loading {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 14px; height: 100%; color: var(--text-muted); font-size: 13.5px;
+}

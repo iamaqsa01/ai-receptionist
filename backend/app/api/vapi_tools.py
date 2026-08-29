@@ -1,0 +1,250 @@
+import uuid
+from datetime import timedelta, timezone
+from zoneinfo import ZoneInfo
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import ValidationError
+from sqlalchemy.orm import Session
+
+from app.ai.qualification.validators import validate_name, validate_phone
+from app.ai.scheduling.outcomes import BookingOutcome
+from app.database.session import get_db
+from app.integrations.vapi.security import (
+    create_availability_token,
+    decode_availability_token,
+    verify_vapi_tool_request,
+)
+from app.models.workspace import Workspace
+from app.schemas.vapi import (
+    BookAppointmentArguments,
+    CheckAvailabilityArguments,
+    VapiToolCall,
+    VapiToolRequest,
+    VapiToolResponse,
+    VapiToolResult,
+)
+from app.services.scheduling import AppointmentBookingRequest, AppointmentSchedulingService
+
+router = APIRouter(
+    prefix="/integrations/vapi/workspaces/{workspace_id}/tools",
+    tags=["vapi-tools"],
+    dependencies=[Depends(verify_vapi_tool_request)],
+)
+
+
+def _result(tool_call: VapiToolCall, result: dict) -> VapiToolResult:
+    return VapiToolResult(toolCallId=tool_call.id, result=result)
+
+
+def _argument_error(tool_call: VapiToolCall, exc: ValidationError) -> VapiToolResult:
+    return _result(
+        tool_call,
+        {
+            "success": False,
+            "code": "INVALID_ARGUMENTS",
+            "message": "; ".join(error["msg"] for error in exc.errors()),
+        },
+    )
+
+
+def _workspace_or_404(db: Session, workspace_id: uuid.UUID) -> Workspace:
+    workspace = db.get(Workspace, workspace_id)
+    if workspace is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
+    return workspace
+
+
+@router.post("/check-availability", response_model=VapiToolResponse)
+def check_availability(
+    workspace_id: uuid.UUID,
+    payload: VapiToolRequest,
+    db: Session = Depends(get_db),
+) -> VapiToolResponse:
+    workspace = _workspace_or_404(db, workspace_id)
+    scheduling = AppointmentSchedulingService(db)
+    results: list[VapiToolResult] = []
+
+    for tool_call in payload.message.tool_call_list:
+        if tool_call.name != "check_availability":
+            results.append(_result(tool_call, {"success": False, "code": "INVALID_TOOL", "message": "Expected check_availability"}))
+            continue
+        try:
+            args = CheckAvailabilityArguments.model_validate(tool_call.arguments)
+        except ValidationError as exc:
+            results.append(_argument_error(tool_call, exc))
+            continue
+
+        service = scheduling.resolve_service(
+            workspace.id, service_id=args.service_id, service_name=args.service_name
+        )
+        if service is None:
+            results.append(_result(tool_call, {"success": False, "code": "SERVICE_NOT_FOUND", "message": "That clinic service was not found."}))
+            continue
+
+        provider_requested = args.provider_id is not None or args.provider_name is not None
+        provider = scheduling.resolve_provider(
+            workspace.id, provider_id=args.provider_id, provider_name=args.provider_name
+        )
+        if provider_requested and provider is None and (args.provider_name or "").strip().lower() not in {
+            "any", "no preference", "no_preference"
+        }:
+            results.append(_result(tool_call, {"success": False, "code": "PROVIDER_NOT_FOUND", "message": "That provider was not found."}))
+            continue
+
+        try:
+            availability = scheduling.find_available_slots(
+                workspace,
+                service,
+                preferred_date=args.preferred_date,
+                preferred_time=args.preferred_time,
+                provider=provider,
+                max_slots=args.max_slots,
+            )
+        except ValueError as exc:
+            results.append(_result(tool_call, {"success": False, "code": "INVALID_CLINIC_TIMEZONE", "message": str(exc)}))
+            continue
+
+        clinic_tz = ZoneInfo(workspace.timezone)
+        slots = []
+        for slot in availability.slots:
+            token = create_availability_token(
+                workspace_id=workspace.id,
+                service_id=service.id,
+                provider_id=slot.provider.id,
+                start_time=slot.start_time,
+                end_time=slot.end_time,
+            )
+            start_local = slot.start_time.astimezone(clinic_tz)
+            end_local = slot.end_time.astimezone(clinic_tz)
+            slots.append(
+                {
+                    "provider_id": str(slot.provider.id),
+                    "provider_name": slot.provider.name,
+                    "start_time": start_local.isoformat(),
+                    "end_time": end_local.isoformat(),
+                    "availability_token": token,
+                }
+            )
+
+        result = {
+            "success": bool(slots),
+            "code": availability.code or "AVAILABLE",
+            "message": availability.message or "Available appointment slots were found.",
+            "timezone": workspace.timezone,
+            "service": {
+                "id": str(service.id),
+                "name": service.name,
+                "duration_minutes": service.duration_minutes,
+            },
+            "available_slots": slots,
+            "availability_token": slots[0]["availability_token"] if slots else None,
+        }
+        results.append(_result(tool_call, result))
+
+    return VapiToolResponse(results=results)
+
+
+@router.post("/book-appointment", response_model=VapiToolResponse)
+def book_appointment(
+    workspace_id: uuid.UUID,
+    payload: VapiToolRequest,
+    db: Session = Depends(get_db),
+) -> VapiToolResponse:
+    workspace = _workspace_or_404(db, workspace_id)
+    scheduling = AppointmentSchedulingService(db)
+    results: list[VapiToolResult] = []
+
+    for tool_call in payload.message.tool_call_list:
+        if tool_call.name != "book_appointment":
+            results.append(_result(tool_call, {"success": False, "code": "INVALID_TOOL", "message": "Expected book_appointment"}))
+            continue
+        try:
+            args = BookAppointmentArguments.model_validate(tool_call.arguments)
+        except ValidationError as exc:
+            results.append(_argument_error(tool_call, exc))
+            continue
+
+        if not payload.call_id:
+            results.append(_result(tool_call, {"success": False, "code": "MISSING_CALL_ID", "message": "The Vapi call ID is required."}))
+            continue
+        if not validate_name(args.patient_name):
+            results.append(_result(tool_call, {"success": False, "code": "INVALID_PATIENT_NAME", "message": "A valid patient name is required."}))
+            continue
+        if not validate_phone(args.patient_phone):
+            results.append(_result(tool_call, {"success": False, "code": "INVALID_PATIENT_PHONE", "message": "The patient phone number must be valid E.164 format."}))
+            continue
+
+        try:
+            token = decode_availability_token(args.availability_token)
+        except ValueError as exc:
+            results.append(_result(tool_call, {"success": False, "code": "INVALID_AVAILABILITY_TOKEN", "message": str(exc)}))
+            continue
+        if token.workspace_id != workspace.id:
+            results.append(_result(tool_call, {"success": False, "code": "INVALID_AVAILABILITY_TOKEN", "message": "The token belongs to another clinic."}))
+            continue
+
+        service = scheduling.resolve_service(workspace.id, service_id=token.service_id)
+        provider = scheduling.resolve_provider(workspace.id, provider_id=token.provider_id)
+        if service is None or provider is None:
+            results.append(_result(tool_call, {"success": False, "code": "CONFIGURATION_CHANGED", "message": "The service or provider is no longer available."}))
+            continue
+        expected_end = token.start_time.astimezone(timezone.utc) + timedelta(minutes=service.duration_minutes)
+        if token.end_time.astimezone(timezone.utc) != expected_end:
+            results.append(_result(tool_call, {"success": False, "code": "INVALID_AVAILABILITY_TOKEN", "message": "The token duration is invalid."}))
+            continue
+
+        note = f"Booked via Vapi ({service.name})"
+        if args.reason:
+            note += f" - {args.reason}"
+        booking = scheduling.book_appointment(
+            AppointmentBookingRequest(
+                workspace=workspace,
+                service=service,
+                provider=provider,
+                start_time=token.start_time,
+                patient_name=args.patient_name,
+                patient_phone=args.patient_phone,
+                patient_email=str(args.patient_email) if args.patient_email else None,
+                notes=note,
+                source="Vapi",
+                vapi_call_id=payload.call_id,
+                vapi_tool_call_id=tool_call.id,
+                enforce_business_hours=True,
+            )
+        )
+
+        if booking.outcome == BookingOutcome.DUPLICATE:
+            results.append(_result(tool_call, {"success": False, "code": "DUPLICATE_BOOKING", "message": "This patient already has an overlapping appointment."}))
+            continue
+        if booking.outcome == BookingOutcome.CONFLICT or booking.appointment is None:
+            results.append(_result(tool_call, {"success": False, "code": "SLOT_TAKEN", "message": "That appointment slot is no longer available. Please check availability again."}))
+            continue
+
+        appointment = booking.appointment
+        db.refresh(appointment)
+        clinic_tz = ZoneInfo(workspace.timezone)
+        results.append(
+            _result(
+                tool_call,
+                {
+                    "success": True,
+                    "code": "BOOKED",
+                    "status": appointment.status,
+                    "appointment_id": str(appointment.id),
+                    "service": {"id": str(service.id), "name": service.name},
+                    "provider": {"id": str(provider.id), "name": provider.name},
+                    "start_time": appointment.start_time.replace(tzinfo=timezone.utc).astimezone(clinic_tz).isoformat()
+                    if appointment.start_time.tzinfo is None
+                    else appointment.start_time.astimezone(clinic_tz).isoformat(),
+                    "end_time": appointment.end_time.replace(tzinfo=timezone.utc).astimezone(clinic_tz).isoformat()
+                    if appointment.end_time.tzinfo is None
+                    else appointment.end_time.astimezone(clinic_tz).isoformat(),
+                    "timezone": workspace.timezone,
+                    "calendar_synced": bool(appointment.external_calendar_event_id),
+                    "idempotent_replay": booking.idempotent_replay,
+                    "message": "The appointment is confirmed.",
+                },
+            )
+        )
+
+    return VapiToolResponse(results=results)

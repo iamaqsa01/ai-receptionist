@@ -1,0 +1,63 @@
+# Local "production-like" stack: Postgres + the backend container built
+# from backend/Dockerfile, wired together the way a real deployment would
+# be (a managed Postgres instead of the `db` service, but same app image
+# and same environment-variable contract). NOT how the frontend is meant
+# to be deployed (Vercel/Netlify serve the static files directly, no
+# Docker involved) — the `frontend` service here exists purely so
+# `docker compose up` gives you the whole thing running locally to poke
+# at, e.g. to verify a production build before shipping it (see
+# docs/deployment.md — "Verify the production build locally").
+#
+# Usage:
+#   cp backend/.env.example backend/.env.docker   # fill in a real SECRET_KEY etc.
+#   docker compose up --build
+#   docker compose exec backend alembic upgrade head   # migrations are explicit, not automatic
+#
+# Then: http://localhost:8000/api/v1/health, http://localhost:5500
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: ${POSTGRES_DB:-ai_receptionist}
+    ports:
+      - "5432:5432"
+    volumes:
+      - ai_receptionist_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env.docker
+    environment:
+      # Overrides whatever POSTGRES_HOST is in the env file — inside this
+      # compose network the DB is reachable at the service name, not
+      # localhost.
+      POSTGRES_HOST: db
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+  frontend:
+    image: nginx:alpine
+    restart: unless-stopped
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+    ports:
+      - "5500:80"
+    depends_on:
+      - backend
+
+volumes:
+  ai_receptionist_pgdata:
