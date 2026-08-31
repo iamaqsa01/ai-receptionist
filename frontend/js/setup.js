@@ -15,11 +15,12 @@
  *
  * `ClinicSettingsUpdate` forbids unknown top-level keys, so this wizard
  * never sends a field the schema doesn't define. A few UI fields the schema
- * has no dedicated column for (clinic phone / email / website / opening
+ * has no dedicated column for (clinic phone / email / website / display
  * hours / free FAQs / general notes) are folded into the one free-text
  * `general_info.address` field — the only public-clinic-info string the
  * contract exposes — clearly delimited with " · " and parsed back out on
- * reload. The Review step shows the exact payload that will be sent.
+ * reload. Structured `business_hours` separately drives availability. The
+ * Review step shows the exact payload that will be sent.
  *
  * No framework, no build step. Reuses the existing design-system classes
  * plus css/onboarding.css.
@@ -36,6 +37,7 @@ window.ClinicOnboarding = (() => {
   // the backend enum does not accept.
   const LANGUAGES = ["English", "Urdu", "Roman Urdu", "Punjabi", "Saraiki", "Sindhi", "Pashto"];
   const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+  const DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
   const ADDRESS_MAX = 500;   // GeneralInfo.address max_length
   const EMERGENCY_MAX = 2000; // ClinicSettingsUpdate.emergency_protocol max_length
   const SEG = " · ";          // delimiter used inside the composed address string
@@ -85,6 +87,12 @@ window.ClinicOnboarding = (() => {
       doctors: [newDoctor()],
       services: [""],
       appointment: { slotMinutes: 30, maxDaily: "" },
+      businessHours: DAY_NAMES.map((_, day) => ({
+        dayOfWeek: day,
+        openTime: day < 5 ? "09:00" : "",
+        closeTime: day < 5 ? "17:00" : "",
+        isClosed: day >= 5,
+      })),
       general: { parking: "", paymentMethods: [""], openingHours: "", generalNotes: "", faqs: [] },
       emergency: "",
       ai: { tone: "Professional", language: "English" },
@@ -506,6 +514,8 @@ window.ClinicOnboarding = (() => {
       cleaned.push({ ...d, name, fee });
     }
     if (!cleaned.length) return { error: "Add at least one doctor." };
+    const doctorKeys = cleaned.map((d) => d.name.toLocaleLowerCase());
+    if (new Set(doctorKeys).size !== doctorKeys.length) return { error: "Doctor names must be unique." };
     // keep the UI list normalised so re-visiting shows what will be saved
     model.doctors = cleaned.map((d) => ({
       name: d.name, specialty: trim(d.specialty), fee: d.fee === null ? "" : String(d.fee),
@@ -551,6 +561,8 @@ window.ClinicOnboarding = (() => {
   function collectServices() {
     const cleaned = model.services.map(trim).filter(Boolean);
     if (!cleaned.length) return { error: "Add at least one service." };
+    const serviceKeys = cleaned.map((name) => name.toLocaleLowerCase());
+    if (new Set(serviceKeys).size !== serviceKeys.length) return { error: "Service names must be unique." };
     model.services = cleaned;
     return { ok: true };
   }
@@ -572,12 +584,42 @@ window.ClinicOnboarding = (() => {
           <input class="input" id="a-max" type="number" min="1" max="1000" step="1" value="${esc(a.maxDaily)}" placeholder="Optional — leave blank for no limit" />
         </div>
       </div>
-      <div class="onboard-hint" style="margin-top:14px;">
-        The backend's appointment configuration currently supports slot duration and a daily
-        booking cap. Per-doctor working days &amp; hours are captured on the Doctors step.
+      <div class="onboard-fieldset" style="margin-top:18px;">
+        <div class="onboard-fieldset__legend">Clinic business hours</div>
+        <div class="onboard-hint" style="margin-bottom:12px;">These hours control when the booking engine offers appointments.</div>
+        <div id="ob-business-hours"></div>
       </div>`;
     $("#a-slot", host).addEventListener("input", (e) => { model.appointment.slotMinutes = e.target.value; });
     $("#a-max", host).addEventListener("input", (e) => { model.appointment.maxDaily = e.target.value; });
+    paintBusinessHours(host);
+  }
+
+  function paintBusinessHours(host) {
+    const wrap = $("#ob-business-hours", host);
+    wrap.innerHTML = model.businessHours.map((hours, day) => `
+      <div class="onboard-inline-row" data-business-day="${day}" style="align-items:center;">
+        <div class="field" style="min-width:120px;margin:0;"><span class="field__label">${DAY_NAMES[day]}</span></div>
+        <label style="display:flex;align-items:center;gap:7px;min-width:82px;">
+          <input type="checkbox" data-f="isClosed"${hours.isClosed ? " checked" : ""} /> Closed
+        </label>
+        <div class="field" style="margin:0;"><input class="input" data-f="openTime" type="time" value="${esc(hours.openTime)}" aria-label="${DAY_NAMES[day]} opening time"${hours.isClosed ? " disabled" : ""} /></div>
+        <span style="color:var(--text-faint);">to</span>
+        <div class="field" style="margin:0;"><input class="input" data-f="closeTime" type="time" value="${esc(hours.closeTime)}" aria-label="${DAY_NAMES[day]} closing time"${hours.isClosed ? " disabled" : ""} /></div>
+      </div>`).join("");
+
+    $$('[data-business-day]', wrap).forEach((row) => {
+      const day = Number(row.dataset.businessDay);
+      $('[data-f="isClosed"]', row).addEventListener("change", (e) => {
+        model.businessHours[day].isClosed = e.target.checked;
+        if (!e.target.checked) {
+          model.businessHours[day].openTime ||= "09:00";
+          model.businessHours[day].closeTime ||= "17:00";
+        }
+        paintBusinessHours(host);
+      });
+      $('[data-f="openTime"]', row).addEventListener("input", (e) => { model.businessHours[day].openTime = e.target.value; });
+      $('[data-f="closeTime"]', row).addEventListener("input", (e) => { model.businessHours[day].closeTime = e.target.value; });
+    });
   }
 
   function collectAppointment() {
@@ -590,6 +632,15 @@ window.ClinicOnboarding = (() => {
     if (max !== null && (max < 1 || max > 1000)) return { error: "Maximum daily bookings must be between 1 and 1000." };
     model.appointment.slotMinutes = Math.round(slot);
     model.appointment.maxDaily = max === null ? "" : String(Math.round(max));
+    for (const hours of model.businessHours) {
+      if (hours.isClosed) continue;
+      if (!hours.openTime || !hours.closeTime) {
+        return { error: `${DAY_NAMES[hours.dayOfWeek]} needs both an opening and closing time.` };
+      }
+      if (hours.closeTime <= hours.openTime) {
+        return { error: `${DAY_NAMES[hours.dayOfWeek]}'s closing time must be after its opening time.` };
+      }
+    }
     return { ok: true };
   }
 
@@ -914,6 +965,12 @@ ${esc(JSON.stringify(payload, null, 2))}</pre>
     return {
       doctors,
       services: model.services.map(trim).filter(Boolean),
+      business_hours: model.businessHours.map((hours) => ({
+        day_of_week: hours.dayOfWeek,
+        open_time: hours.isClosed ? null : hours.openTime,
+        close_time: hours.isClosed ? null : hours.closeTime,
+        is_closed: hours.isClosed,
+      })),
       appointment_settings: {
         default_slot_duration_minutes: Math.round(Number(model.appointment.slotMinutes) || 30),
         max_daily_bookings: maxDaily === null || Number.isNaN(maxDaily) ? null : Math.round(maxDaily),
@@ -941,6 +998,19 @@ ${esc(JSON.stringify(payload, null, 2))}</pre>
       }));
     }
     if (Array.isArray(s.services) && s.services.length) model.services = s.services.slice();
+    if (Array.isArray(s.business_hours) && s.business_hours.length) {
+      const byDay = new Map(s.business_hours.map((hours) => [hours.day_of_week, hours]));
+      model.businessHours = DAY_NAMES.map((_, day) => {
+        const hours = byDay.get(day);
+        if (!hours) return { dayOfWeek: day, openTime: "", closeTime: "", isClosed: true };
+        return {
+          dayOfWeek: day,
+          openTime: hours.open_time ? String(hours.open_time).slice(0, 5) : "",
+          closeTime: hours.close_time ? String(hours.close_time).slice(0, 5) : "",
+          isClosed: Boolean(hours.is_closed),
+        };
+      });
+    }
 
     const appt = s.appointment_settings || {};
     if (appt.default_slot_duration_minutes) model.appointment.slotMinutes = appt.default_slot_duration_minutes;

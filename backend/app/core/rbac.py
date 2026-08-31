@@ -11,6 +11,8 @@ PERMISSIONS: dict[str, set[str]] = {
     "members:manage": {OWNER, ADMIN},
     "settings:read": {OWNER, ADMIN, RECEPTIONIST, ANALYST},
     "settings:manage": {OWNER, ADMIN},
+    "integrations:read": {OWNER, ADMIN, RECEPTIONIST, ANALYST},
+    "integrations:manage": {OWNER, ADMIN},
     "patients:read": {OWNER, ADMIN, RECEPTIONIST, ANALYST},
     "patients:write": {OWNER, ADMIN, RECEPTIONIST},
     "leads:read": {OWNER, ADMIN, RECEPTIONIST, ANALYST},

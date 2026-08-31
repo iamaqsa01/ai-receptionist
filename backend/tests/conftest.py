@@ -1,3 +1,4 @@
+import os
 import uuid
 
 import pytest
@@ -7,6 +8,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.core.rate_limit import login_rate_limiter, register_rate_limiter, telephony_webhook_rate_limiter
+from app.core.config import settings
 from app.database.session import get_db
 from app.main import app
 from app.models import Base
@@ -24,6 +26,26 @@ def _reset_rate_limiters():
     for limiter in (login_rate_limiter, register_rate_limiter, telephony_webhook_rate_limiter):
         limiter._hits.clear()
     yield
+
+
+@pytest.fixture(autouse=True)
+def _use_mock_calendar_unless_live_test_is_explicitly_enabled():
+    """Keep ordinary tests hermetic even when local/CI deployment config uses Google.
+
+    The opt-in live test is the only test allowed to inherit the real calendar
+    provider from the environment. This prevents fixtures containing example
+    calendar IDs from issuing Google API calls.
+    """
+    if os.getenv("RUN_GOOGLE_CALENDAR_LIVE_TEST") == "1":
+        yield
+        return
+
+    previous_provider = settings.calendar_provider
+    settings.calendar_provider = "mock"
+    try:
+        yield
+    finally:
+        settings.calendar_provider = previous_provider
 
 
 @pytest.fixture()

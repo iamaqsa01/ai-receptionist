@@ -1,6 +1,6 @@
 from typing import Any
 
-from sqlalchemy import Boolean, String
+from sqlalchemy import Boolean, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.base import Base, TimestampMixin, UUIDPKMixin, WorkspaceOwnedMixin
@@ -14,6 +14,9 @@ class Integration(UUIDPKMixin, TimestampMixin, WorkspaceOwnedMixin, Base):
     manager, not this table."""
 
     __tablename__ = "integrations"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "provider", name="uq_integrations_workspace_provider"),
+    )
 
     provider: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     config: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict, nullable=False)

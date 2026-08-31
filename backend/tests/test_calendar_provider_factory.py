@@ -39,3 +39,9 @@ def test_google_provider_available_once_credentials_are_set():
 
     provider = GoogleCalendarProvider(service_account_info={"type": "service_account", "project_id": "fake"})
     assert provider.is_available() is True
+
+
+def test_google_provider_restores_utc_timezone_after_naive_database_round_trip():
+    from app.integrations.calendar.google_provider import _google_datetime
+
+    assert _google_datetime(datetime(2026, 9, 30, 3, 0)) == "2026-09-30T03:00:00+00:00"

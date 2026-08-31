@@ -120,6 +120,12 @@ class Settings(BaseSettings):
     calendar_provider: str = "mock"  # "mock" | "google"
     google_service_account_json: str = ""  # raw JSON string, not a file path
     google_calendar_timeout_seconds: float = 10.0
+    # Per-workspace Google OAuth (SaaS clinic connections). OAuth tokens are
+    # encrypted at rest with a key derived from SECRET_KEY; the redirect URI
+    # must exactly match the Google Cloud Console OAuth client configuration.
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    google_redirect_uri: str = ""
 
     # WhatsApp / email notifications (Phase 9). Each falls back to a mock
     # adapter automatically when its credentials are missing, same pattern

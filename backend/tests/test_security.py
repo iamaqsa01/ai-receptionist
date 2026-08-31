@@ -15,6 +15,21 @@ from app.core.rate_limit import RateLimiter
 from tests.conftest import auth_headers, create_workspace, register_and_login
 
 
+COMPLETE_CLINIC_SETTINGS = {
+    "doctors": [{"name": "Dr. Security", "specialty": "General Practice"}],
+    "services": ["Consultation"],
+    "business_hours": [
+        {
+            "day_of_week": day,
+            "open_time": "09:00:00" if day < 5 else None,
+            "close_time": "17:00:00" if day < 5 else None,
+            "is_closed": day >= 5,
+        }
+        for day in range(7)
+    ],
+}
+
+
 # -- Twilio webhook signature verification --------------------------------------------
 
 
@@ -384,7 +399,11 @@ def test_workspace_can_still_complete_onboarding_then_use_data_routes(client):
     assert client.get(f"/api/v1/workspaces/{ws_id}/patients", headers=hdrs).status_code == 403
 
     # Completing the clinic-settings form flips workspaces.is_onboarded.
-    assert client.put(f"/api/v1/workspaces/{ws_id}/clinic-settings", json={}, headers=hdrs).status_code == 200
+    assert client.put(
+        f"/api/v1/workspaces/{ws_id}/clinic-settings",
+        json=COMPLETE_CLINIC_SETTINGS,
+        headers=hdrs,
+    ).status_code == 200
 
     # Now the gated routes open up — for this workspace.
     assert client.get(f"/api/v1/workspaces/{ws_id}/patients", headers=hdrs).status_code == 200
@@ -413,7 +432,11 @@ def test_non_member_gets_404_regardless_of_workspace_onboarding_state(client):
 
 
 def _complete_onboarding(client, token, ws_id):
-    r = client.put(f"/api/v1/workspaces/{ws_id}/clinic-settings", json={}, headers=auth_headers(token))
+    r = client.put(
+        f"/api/v1/workspaces/{ws_id}/clinic-settings",
+        json=COMPLETE_CLINIC_SETTINGS,
+        headers=auth_headers(token),
+    )
     assert r.status_code == 200, r.text
 
 

@@ -1,94 +1,104 @@
-import logging
 import uuid
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.ai.scheduling.outcomes import BookingOutcome
 from app.api.deps import TenantContext, get_current_onboarded_tenant, require_permission
-from app.database.session import SessionLocal, get_db
-from app.integrations.notifications.service import NotificationService
+from app.database.session import get_db
 from app.models.appointment import Appointment
 from app.models.patient import Patient
 from app.models.provider import Provider
 from app.models.service import Service
+from app.models.workspace import Workspace
 from app.schemas.appointment import AppointmentCreate, AppointmentOut
 from app.services.audit import record_audit_log
+from app.services.scheduling import AppointmentBookingRequest, AppointmentSchedulingService
 
-logger = logging.getLogger(__name__)
-
-router = APIRouter(prefix="/workspaces/{workspace_id}/appointments", tags=["appointments"], dependencies=[Depends(get_current_onboarded_tenant)])
-
-
-def _send_booking_confirmation(appointment_id: uuid.UUID) -> None:
-    """Runs after the HTTP response is sent (FastAPI BackgroundTasks) on
-    its own short-lived DB session. Only ever invoked once the appointment
-    row is committed, so it never notifies for a booking that failed. A
-    messaging-provider outage is contained here — it's recorded as a
-    "failed" NotificationMessage row (retryable) and never surfaced to the
-    caller."""
-    db = SessionLocal()
-    try:
-        appointment = db.get(Appointment, appointment_id)
-        if appointment is None:
-            return
-        patient = db.get(Patient, appointment.patient_id)
-        if patient is None:
-            return
-        provider = db.get(Provider, appointment.provider_id) if appointment.provider_id else None
-        service = db.get(Service, appointment.service_id) if appointment.service_id else None
-        summary = service.name if service is not None else "your appointment"
-        NotificationService(db=db).notify_appointment_event(
-            "appointment_confirmation", appointment, patient, service_summary=summary, provider=provider
-        )
-    except Exception:
-        logger.exception("failed to dispatch booking confirmation for appointment=%s", appointment_id)
-    finally:
-        db.close()
+router = APIRouter(
+    prefix="/workspaces/{workspace_id}/appointments",
+    tags=["appointments"],
+    dependencies=[Depends(get_current_onboarded_tenant)],
+)
 
 
 @router.post("", response_model=AppointmentOut, status_code=status.HTTP_201_CREATED)
 def create_appointment(
     payload: AppointmentCreate,
-    background_tasks: BackgroundTasks,
     ctx: TenantContext = Depends(require_permission("appointments:write")),
     db: Session = Depends(get_db),
 ) -> Appointment:
-    # Every referenced foreign key must belong to this same workspace —
-    # otherwise a caller could link an appointment to another tenant's
-    # patient/provider/service record (tenant-isolation / IDOR).
+    """Create a staff booking through the canonical scheduling service."""
     patient = db.execute(
-        select(Patient).where(Patient.id == payload.patient_id, Patient.workspace_id == ctx.workspace_id)
+        select(Patient).where(
+            Patient.id == payload.patient_id,
+            Patient.workspace_id == ctx.workspace_id,
+        )
     ).scalar_one_or_none()
     if patient is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found")
 
+    provider = None
     if payload.provider_id is not None:
         provider = db.execute(
-            select(Provider).where(Provider.id == payload.provider_id, Provider.workspace_id == ctx.workspace_id)
+            select(Provider).where(
+                Provider.id == payload.provider_id,
+                Provider.workspace_id == ctx.workspace_id,
+            )
         ).scalar_one_or_none()
         if provider is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Provider not found")
 
+    service = None
     if payload.service_id is not None:
         service = db.execute(
-            select(Service).where(Service.id == payload.service_id, Service.workspace_id == ctx.workspace_id)
+            select(Service).where(
+                Service.id == payload.service_id,
+                Service.workspace_id == ctx.workspace_id,
+            )
         ).scalar_one_or_none()
         if service is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Service not found")
 
-    appointment = Appointment(workspace_id=ctx.workspace_id, status="scheduled", **payload.model_dump())
-    db.add(appointment)
-    db.commit()
-    db.refresh(appointment)
+    workspace = db.get(Workspace, ctx.workspace_id)
+    if workspace is None:  # The tenant dependency normally makes this unreachable.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
+
+    scheduling = AppointmentSchedulingService(db)
+    try:
+        booking = scheduling.book_appointment(
+            AppointmentBookingRequest(
+                workspace=workspace,
+                patient=patient,
+                provider=provider,
+                service=service,
+                start_time=payload.start_time,
+                end_time=payload.end_time,
+                notes=payload.notes,
+                source="dashboard",
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+
+    if booking.outcome == BookingOutcome.DUPLICATE:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The patient already has an overlapping appointment",
+        )
+    if booking.outcome != BookingOutcome.CREATED or booking.appointment is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="The appointment slot is unavailable")
+
+    appointment = booking.appointment
     record_audit_log(
-        db, action="appointment.created", resource_type="appointment",
-        workspace_id=ctx.workspace_id, actor_user_id=ctx.user.id, resource_id=appointment.id,
+        db,
+        action="appointment.created",
+        resource_type="appointment",
+        workspace_id=ctx.workspace_id,
+        actor_user_id=ctx.user.id,
+        resource_id=appointment.id,
     )
-    # DB write is committed above — trigger the confirmation immediately,
-    # off the request path so a messaging-provider outage can't fail the
-    # booking response.
-    background_tasks.add_task(_send_booking_confirmation, appointment.id)
     return appointment
 
 
@@ -110,7 +120,8 @@ def get_appointment(
 ) -> Appointment:
     appointment = db.execute(
         select(Appointment).where(
-            Appointment.id == appointment_id, Appointment.workspace_id == ctx.workspace_id
+            Appointment.id == appointment_id,
+            Appointment.workspace_id == ctx.workspace_id,
         )
     ).scalar_one_or_none()
     if appointment is None:

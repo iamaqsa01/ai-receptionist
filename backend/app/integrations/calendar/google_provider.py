@@ -1,7 +1,7 @@
 import logging
 import socket
-from datetime import datetime
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Callable
 
 from app.integrations.calendar.base import CalendarEvent, CalendarProvider
 from app.integrations.calendar.exceptions import (
@@ -14,6 +14,20 @@ from app.integrations.calendar.exceptions import (
 logger = logging.getLogger(__name__)
 
 _SCOPES = ["https://www.googleapis.com/auth/calendar"]
+
+
+def _google_datetime(value: datetime) -> str:
+    """Return an RFC3339 value Google accepts after any database round trip.
+
+    PostgreSQL preserves timezone-aware appointment values. SQLite, used by
+    the isolated test suite and lightweight local verification, can return a
+    naive value even for ``DateTime(timezone=True)``. Appointment timestamps
+    are canonical UTC throughout the application, so a missing timezone is
+    safely restored as UTC here at the provider boundary.
+    """
+    if value.tzinfo is None or value.utcoffset() is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.isoformat()
 
 
 class GoogleCalendarProvider(CalendarProvider):
@@ -90,16 +104,27 @@ class GoogleCalendarProvider(CalendarProvider):
             return CalendarAPIError(str(exc), status_code=status)
         return CalendarAPIError(str(exc))
 
+    def _after_request(self) -> None:
+        """Hook used by OAuth credentials to persist automatic refreshes."""
+
     def check_availability(self, calendar_id: str, start: datetime, end: datetime) -> bool:
         service = self._get_service()
         try:
             response = (
                 service.freebusy()
-                .query(body={"timeMin": start.isoformat(), "timeMax": end.isoformat(), "items": [{"id": calendar_id}]})
+                .query(
+                    body={
+                        "timeMin": _google_datetime(start),
+                        "timeMax": _google_datetime(end),
+                        "items": [{"id": calendar_id}],
+                    }
+                )
                 .execute(num_retries=0)
             )
         except Exception as exc:
             raise self._translate_error(exc) from exc
+        finally:
+            self._after_request()
         busy_periods = response.get("calendars", {}).get(calendar_id, {}).get("busy", [])
         return len(busy_periods) == 0
 
@@ -110,13 +135,15 @@ class GoogleCalendarProvider(CalendarProvider):
         body = {
             "summary": summary,
             "description": description,
-            "start": {"dateTime": start.isoformat()},
-            "end": {"dateTime": end.isoformat()},
+            "start": {"dateTime": _google_datetime(start)},
+            "end": {"dateTime": _google_datetime(end)},
         }
         try:
             created = service.events().insert(calendarId=calendar_id, body=body).execute(num_retries=0)
         except Exception as exc:
             raise self._translate_error(exc) from exc
+        finally:
+            self._after_request()
         return CalendarEvent(external_event_id=created["id"], summary=summary, start=start, end=end)
 
     def update_event(
@@ -131,8 +158,8 @@ class GoogleCalendarProvider(CalendarProvider):
     ) -> CalendarEvent:
         service = self._get_service()
         body: dict[str, Any] = {
-            "start": {"dateTime": start.isoformat()},
-            "end": {"dateTime": end.isoformat()},
+            "start": {"dateTime": _google_datetime(start)},
+            "end": {"dateTime": _google_datetime(end)},
         }
         if summary is not None:
             body["summary"] = summary
@@ -146,6 +173,8 @@ class GoogleCalendarProvider(CalendarProvider):
             )
         except Exception as exc:
             raise self._translate_error(exc) from exc
+        finally:
+            self._after_request()
         return CalendarEvent(
             external_event_id=external_event_id, summary=updated.get("summary", summary or ""), start=start, end=end
         )
@@ -165,3 +194,75 @@ class GoogleCalendarProvider(CalendarProvider):
             raise self._translate_error(exc) from exc
         except Exception as exc:
             raise self._translate_error(exc) from exc
+        finally:
+            self._after_request()
+
+
+class GoogleOAuthCalendarProvider(GoogleCalendarProvider):
+    """Google Calendar API provider backed by one workspace's OAuth grant."""
+
+    def __init__(
+        self,
+        *,
+        access_token: str | None,
+        refresh_token: str | None,
+        token_expiry: datetime | None,
+        client_id: str,
+        client_secret: str,
+        timeout_seconds: float = 10.0,
+        on_credentials_updated: Callable[[str, datetime | None], None] | None = None,
+    ) -> None:
+        super().__init__(service_account_info=None, timeout_seconds=timeout_seconds)
+        self._access_token = access_token
+        self._refresh_token = refresh_token
+        self._token_expiry = token_expiry
+        self._client_id = client_id
+        self._client_secret = client_secret
+        self._on_credentials_updated = on_credentials_updated
+        self._credentials = None
+        self._last_saved_token = access_token
+        self._last_saved_expiry = token_expiry
+
+    def is_available(self) -> bool:
+        return bool(self._refresh_token and self._client_id and self._client_secret)
+
+    def _get_service(self):
+        if self._service is not None:
+            return self._service
+        if not self.is_available():
+            raise CalendarAuthError("Google Calendar OAuth credentials are incomplete; reconnect Google Calendar")
+
+        import httplib2
+        from google.oauth2.credentials import Credentials
+        from google_auth_httplib2 import AuthorizedHttp
+        from googleapiclient.discovery import build
+
+        try:
+            self._credentials = Credentials(
+                token=self._access_token,
+                refresh_token=self._refresh_token,
+                token_uri="https://oauth2.googleapis.com/token",
+                client_id=self._client_id,
+                client_secret=self._client_secret,
+                scopes=_SCOPES,
+                expiry=self._token_expiry,
+            )
+            http = httplib2.Http(timeout=self._timeout_seconds)
+            authed_http = AuthorizedHttp(self._credentials, http=http)
+            self._service = build("calendar", "v3", http=authed_http, cache_discovery=False)
+        except Exception as exc:
+            raise self._translate_error(exc) from exc
+        return self._service
+
+    def _after_request(self) -> None:
+        credentials = self._credentials
+        if credentials is None or not credentials.token or self._on_credentials_updated is None:
+            return
+        expiry = credentials.expiry
+        if expiry is not None and (expiry.tzinfo is None or expiry.utcoffset() is None):
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        if credentials.token == self._last_saved_token and expiry == self._last_saved_expiry:
+            return
+        self._on_credentials_updated(credentials.token, expiry)
+        self._last_saved_token = credentials.token
+        self._last_saved_expiry = expiry

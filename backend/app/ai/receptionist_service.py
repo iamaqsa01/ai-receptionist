@@ -22,7 +22,6 @@ from app.ai.llm.factory import get_llm_provider
 from app.ai.nlu.engine import NLUEngine
 from app.ai.qualification.validators import next_lead_status
 from app.ai.scheduling.outcomes import BookingOutcome
-from app.ai.scheduling.rules import ExistingBooking, as_aware_utc, find_overlapping
 from app.integrations.calendar.base import CalendarProvider
 from app.integrations.calendar.sync import CalendarSyncService
 from app.integrations.notifications.base import EmailProvider, WhatsAppProvider
@@ -239,19 +238,6 @@ class ReceptionistService:
             .order_by(Appointment.start_time)
         ).scalars().first()
 
-    def _scheduled_appointments(
-        self, workspace_id: uuid.UUID, *, patient_id: uuid.UUID | None = None, provider_id: uuid.UUID | None = None
-    ) -> list[ExistingBooking]:
-        stmt = select(Appointment).where(
-            Appointment.workspace_id == workspace_id, Appointment.status == "scheduled"
-        )
-        if patient_id is not None:
-            stmt = stmt.where(Appointment.patient_id == patient_id)
-        if provider_id is not None:
-            stmt = stmt.where(Appointment.provider_id == provider_id)
-        rows = self.db.execute(stmt).scalars().all()
-        return [ExistingBooking(id=row.id, start_time=row.start_time, end_time=row.end_time) for row in rows]
-
     def _book_appointment(self, workspace_id: uuid.UUID, effect: BookAppointmentEffect) -> BookingOutcome:
         """Availability checking, conflict detection, and duplicate-booking
         prevention — the actual database write happens only if all three
@@ -312,38 +298,7 @@ class ReceptionistService:
         if appointment is None:
             return BookingOutcome.NOT_FOUND
 
-        duration = appointment.end_time - appointment.start_time
-        new_start = as_aware_utc(effect.new_when)
-        new_end = new_start + duration
-
-        if appointment.provider_id is not None:
-            provider_bookings = [
-                b
-                for b in self._scheduled_appointments(workspace_id, provider_id=appointment.provider_id)
-                if b.id != appointment.id
-            ]
-            if find_overlapping(new_start, new_end, provider_bookings) is not None:
-                return BookingOutcome.RESCHEDULE_CONFLICT
-
-        # Same external-availability check as booking, against the new
-        # window (see _book_appointment for why a None result never blocks).
-        # Checked against a throwaway stand-in first so a conflict never
-        # touches the real (still-persisted-at-its-old-time) appointment.
-        proposed = Appointment(start_time=new_start, end_time=new_end)
-        if self.calendar.check_availability(workspace_id, proposed) is False:
-            return BookingOutcome.RESCHEDULE_CONFLICT
-
-        appointment.start_time = new_start
-        appointment.end_time = new_end
-        self.db.add(appointment)
-        self.db.commit()
-        self.calendar.update_event(workspace_id, appointment)
-        patient = self.db.get(Patient, appointment.patient_id)
-        if patient is not None:
-            self.notifications.notify_appointment_event(
-                "appointment_reschedule", appointment, patient, service_summary=self._service_summary_for(appointment)
-            )
-        return BookingOutcome.RESCHEDULED
+        return self.scheduling.reschedule_appointment(appointment, effect.new_when).outcome
 
     def _service_summary_for(self, appointment: Appointment) -> str:
         if appointment.service_id is None:

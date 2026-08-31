@@ -20,6 +20,7 @@ from app.schemas.workspace import (
     WorkspaceUpdate,
 )
 from app.services.audit import record_audit_log
+from app.services.clinic_settings import sync_booking_configuration
 
 router = APIRouter(prefix="/workspaces", tags=["workspaces"])
 
@@ -144,6 +145,21 @@ def update_clinic_settings(
     if workspace is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
 
+    # A workspace is only ready for real booking once every normalized
+    # scheduling resource can be created. Existing/onboarded workspaces may
+    # still save partial settings for backwards compatibility, but the
+    # first onboarding completion must be operationally complete.
+    if not workspace.is_onboarded:
+        if not payload.doctors:
+            raise HTTPException(status_code=422, detail="At least one doctor is required")
+        if not payload.services:
+            raise HTTPException(status_code=422, detail="At least one service is required")
+        if {hours.day_of_week for hours in payload.business_hours} != set(range(7)):
+            raise HTTPException(
+                status_code=422,
+                detail="Business hours must include all seven weekdays",
+            )
+
     agent = _active_agent(db, workspace_id)
     if agent is None:
         # First time the dashboard saves settings for this workspace —
@@ -156,6 +172,13 @@ def update_clinic_settings(
     # every other config key (instructions, supported_languages, ...) intact.
     agent.config = {**(agent.config or {}), "clinic_settings": payload.model_dump(mode="json")}
     db.add(agent)
+
+    # The JSON settings drive the clinic knowledge base, while these
+    # existing normalized tables drive real availability and booking. Keep
+    # both representations synchronized in this same transaction so a
+    # workspace can never be marked onboarded with only half its scheduling
+    # configuration saved.
+    sync_booking_configuration(db, workspace_id, payload)
 
     # Completing clinic settings is what marks THIS WORKSPACE onboarded — the
     # frontend routes to /setup for this workspace until it flips, and

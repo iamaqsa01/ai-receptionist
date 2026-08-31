@@ -307,6 +307,19 @@ const Api = (() => {
     },
   };
 
+  // -- Scheduling resources ------------------------------------------------------
+  const providers = {
+    async list() {
+      return request(workspacePath("/providers"));
+    },
+  };
+
+  const services = {
+    async list() {
+      return request(workspacePath("/services"));
+    },
+  };
+
   // -- Calls + transcripts --------------------------------------------------------
   const calls = {
     async list() {
@@ -343,6 +356,22 @@ const Api = (() => {
     },
   };
 
+  // -- Workspace integrations ----------------------------------------------------
+  const integrations = {
+    async googleStatus() {
+      return request("/integrations/google/status", { query: { workspace_id: getWorkspaceId() } });
+    },
+    async googleConnect() {
+      return request("/integrations/google/connect", { query: { workspace_id: getWorkspaceId() } });
+    },
+    async googleDisconnect() {
+      return request("/integrations/google/disconnect", {
+        method: "POST",
+        query: { workspace_id: getWorkspaceId() },
+      });
+    },
+  };
+
   // -- AI Receptionist conversation (test-drive widget) -----------------------------
   const ai = {
     async startSession() {
@@ -368,6 +397,7 @@ const Api = (() => {
     getToken, isTokenExpired, isAuthenticated, clearSession,
     getWorkspaceId, setWorkspaceId, clearWorkspaceId,
     getBranchModel, setBranchModel, clearBranchModel,
-    auth, workspaces, clinicSettings, leads, patients, appointments, calls, handoffs, notificationMessages, ai, health, analytics,
+    auth, workspaces, clinicSettings, leads, patients, appointments, providers, services,
+    calls, handoffs, notificationMessages, ai, health, analytics, integrations,
   };
 })();

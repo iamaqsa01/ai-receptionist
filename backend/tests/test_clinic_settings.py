@@ -1,8 +1,10 @@
 """Clinic settings / AI knowledge base — dashboard save + prompt build.
 
 The complete clinic configuration is stored in the workspace's active
-``ai_agents.config["clinic_settings"]`` (no new table) and folded into the
-AI Receptionist's system prompt by ``generate_system_prompt``."""
+``ai_agents.config["clinic_settings"]`` while normalized scheduling data is
+kept in the existing providers, services, and business-hours tables. Settings
+are folded into the AI Receptionist's system prompt by
+``generate_system_prompt``."""
 
 import uuid
 
@@ -10,6 +12,9 @@ import pytest
 
 from app.ai.conversation.instructions import generate_system_prompt
 from app.models.ai_agent import AIAgent
+from app.models.business_hours import BusinessHours
+from app.models.provider import Provider
+from app.models.service import Service
 from app.models.workspace import Workspace
 from tests.conftest import auth_headers, create_workspace, register_and_login
 
@@ -23,6 +28,15 @@ SAMPLE_SETTINGS = {
         }
     ],
     "services": ["Skin Consultation", "Laser Treatment"],
+    "business_hours": [
+        {
+            "day_of_week": day,
+            "open_time": "09:00:00" if day < 5 else None,
+            "close_time": "17:00:00" if day < 5 else None,
+            "is_closed": day >= 5,
+        }
+        for day in range(7)
+    ],
     "appointment_settings": {"default_slot_duration_minutes": 20, "max_daily_bookings": 40},
     "general_info": {
         "address": "12 Clinic Road, Lahore",
@@ -83,6 +97,121 @@ def test_saving_clinic_settings_marks_workspace_onboarded(client):
 
     assert membership(ws_id)["is_onboarded"] is True
     assert client.get(f"/api/v1/workspaces/{ws_id}", headers=auth_headers(token)).json()["is_onboarded"] is True
+
+
+def test_onboarding_creates_real_booking_records(client, db_session):
+    token = register_and_login(client, "booking-records-owner@example.com")
+    ws_id = create_workspace(client, token, "Booking Records Clinic", "booking-records", onboarded=False)
+
+    response = client.put(
+        f"/api/v1/workspaces/{ws_id}/clinic-settings",
+        headers=auth_headers(token),
+        json=SAMPLE_SETTINGS,
+    )
+    assert response.status_code == 200, response.text
+
+    workspace_uuid = uuid.UUID(ws_id)
+    providers = db_session.query(Provider).filter_by(workspace_id=workspace_uuid).all()
+    services = db_session.query(Service).filter_by(workspace_id=workspace_uuid).all()
+    hours = (
+        db_session.query(BusinessHours)
+        .filter_by(workspace_id=workspace_uuid)
+        .order_by(BusinessHours.day_of_week)
+        .all()
+    )
+
+    assert [(provider.name, provider.title, provider.is_active) for provider in providers] == [
+        ("Dr. Ayesha Khan", "Dermatology", True)
+    ]
+    assert {(service.name, service.duration_minutes, service.is_active) for service in services} == {
+        ("Skin Consultation", 20, True),
+        ("Laser Treatment", 20, True),
+    }
+    assert len(hours) == 7
+    assert hours[0].open_time.isoformat() == "09:00:00"
+    assert hours[0].close_time.isoformat() == "17:00:00"
+    assert hours[0].is_closed is False
+    assert hours[6].open_time is None
+    assert hours[6].close_time is None
+    assert hours[6].is_closed is True
+
+
+def test_booking_record_sync_is_idempotent_and_soft_deactivates_removed_rows(client, db_session):
+    token = register_and_login(client, "booking-sync-owner@example.com")
+    ws_id = create_workspace(client, token, "Booking Sync Clinic", "booking-sync", onboarded=False)
+    headers = auth_headers(token)
+    url = f"/api/v1/workspaces/{ws_id}/clinic-settings"
+
+    assert client.put(url, headers=headers, json=SAMPLE_SETTINGS).status_code == 200
+    updated = {
+        **SAMPLE_SETTINGS,
+        "doctors": [
+            {
+                **SAMPLE_SETTINGS["doctors"][0],
+                "name": "dr. ayesha khan",
+                "specialty": "Cosmetic Dermatology",
+            }
+        ],
+        "services": ["skin consultation"],
+        "appointment_settings": {
+            "default_slot_duration_minutes": 45,
+            "max_daily_bookings": 20,
+        },
+        "business_hours": [
+            {
+                "day_of_week": day,
+                "open_time": "10:00:00" if day == 0 else None,
+                "close_time": "14:00:00" if day == 0 else None,
+                "is_closed": day != 0,
+            }
+            for day in range(7)
+        ],
+    }
+    assert client.put(url, headers=headers, json=updated).status_code == 200
+
+    workspace_uuid = uuid.UUID(ws_id)
+    providers = db_session.query(Provider).filter_by(workspace_id=workspace_uuid).all()
+    services = db_session.query(Service).filter_by(workspace_id=workspace_uuid).all()
+    hours = db_session.query(BusinessHours).filter_by(workspace_id=workspace_uuid).all()
+
+    assert len(providers) == 1
+    assert providers[0].name == "dr. ayesha khan"
+    assert providers[0].title == "Cosmetic Dermatology"
+    assert providers[0].is_active is True
+    assert len(services) == 2
+    active = next(service for service in services if service.is_active)
+    inactive = next(service for service in services if not service.is_active)
+    assert active.name == "skin consultation"
+    assert active.duration_minutes == 45
+    assert inactive.name == "Laser Treatment"
+    assert len(hours) == 7
+    monday = next(row for row in hours if row.day_of_week == 0)
+    tuesday = next(row for row in hours if row.day_of_week == 1)
+    assert monday.open_time.isoformat() == "10:00:00"
+    assert monday.close_time.isoformat() == "14:00:00"
+    assert monday.is_closed is False
+    assert tuesday.is_closed is True
+
+
+def test_first_onboarding_requires_complete_business_configuration(client):
+    token = register_and_login(client, "incomplete-booking-owner@example.com")
+    ws_id = create_workspace(client, token, "Incomplete Clinic", "incomplete-booking", onboarded=False)
+    headers = auth_headers(token)
+
+    for patch, expected_detail in [
+        ({"doctors": []}, "At least one doctor is required"),
+        ({"services": []}, "At least one service is required"),
+        ({"business_hours": []}, "Business hours must include all seven weekdays"),
+    ]:
+        response = client.put(
+            f"/api/v1/workspaces/{ws_id}/clinic-settings",
+            headers=headers,
+            json={**SAMPLE_SETTINGS, **patch},
+        )
+        assert response.status_code == 422
+        assert response.json()["detail"] == expected_detail
+
+    assert client.get(f"/api/v1/workspaces/{ws_id}", headers=headers).json()["is_onboarded"] is False
 
 
 def test_onboarding_state_is_independent_per_workspace(client):

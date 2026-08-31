@@ -13,7 +13,7 @@ from app.integrations.calendar.exceptions import (
     CalendarSlotUnavailableError,
     CalendarTimeoutError,
 )
-from app.integrations.calendar.factory import get_calendar_provider
+from app.integrations.calendar.factory import get_calendar_provider_for_workspace
 from app.models.appointment import Appointment
 from app.models.notification import Notification
 from app.services.integration_log import record_integration_log
@@ -40,7 +40,10 @@ class CalendarSyncService:
 
     def __init__(self, db: Session, provider: CalendarProvider | None = None) -> None:
         self.db = db
-        self.provider = provider or get_calendar_provider()
+        self.provider = provider
+
+    def _provider_for(self, workspace_id: uuid.UUID) -> CalendarProvider:
+        return self.provider or get_calendar_provider_for_workspace(self.db, workspace_id)
 
     def check_availability(self, workspace_id: uuid.UUID, appointment: Appointment) -> bool | None:
         """True/False if the calendar answered; None if calendar sync isn't
@@ -50,12 +53,13 @@ class CalendarSyncService:
         config = load_calendar_integration(self.db, workspace_id)
         if config is None:
             return None
+        provider = self._provider_for(workspace_id)
         try:
-            return self.provider.check_availability(config.calendar_id, appointment.start_time, appointment.end_time)
+            return provider.check_availability(config.calendar_id, appointment.start_time, appointment.end_time)
         except CalendarSlotUnavailableError:
             return False
         except CalendarError as exc:
-            self._report_failure(workspace_id, exc, "check calendar availability for", action="check_availability")
+            self._report_failure(workspace_id, provider, exc, "check calendar availability for", action="check_availability")
             return None
 
     def create_event(self, workspace_id: uuid.UUID, appointment: Appointment, *, summary: str, description: str) -> None:
@@ -66,8 +70,9 @@ class CalendarSyncService:
         config = load_calendar_integration(self.db, workspace_id)
         if config is None:
             return
+        provider = self._provider_for(workspace_id)
         try:
-            event = self.provider.create_event(
+            event = provider.create_event(
                 config.calendar_id,
                 summary=summary,
                 description=description,
@@ -75,13 +80,13 @@ class CalendarSyncService:
                 end=appointment.end_time,
             )
         except CalendarError as exc:
-            self._report_failure(workspace_id, exc, "create a calendar event for", action="create_event")
+            self._report_failure(workspace_id, provider, exc, "create a calendar event for", action="create_event")
             return
-        appointment.external_calendar_provider = self.provider.name
+        appointment.external_calendar_provider = provider.name
         appointment.external_calendar_event_id = event.external_event_id
         self.db.add(appointment)
         self.db.commit()
-        self._report_success(workspace_id, "create_event")
+        self._report_success(workspace_id, provider, "create_event")
 
     def update_event(self, workspace_id: uuid.UUID, appointment: Appointment) -> None:
         if not appointment.external_calendar_event_id:
@@ -89,17 +94,18 @@ class CalendarSyncService:
         config = load_calendar_integration(self.db, workspace_id)
         if config is None:
             return
+        provider = self._provider_for(workspace_id)
         try:
-            self.provider.update_event(
+            provider.update_event(
                 config.calendar_id,
                 appointment.external_calendar_event_id,
                 start=appointment.start_time,
                 end=appointment.end_time,
             )
         except CalendarError as exc:
-            self._report_failure(workspace_id, exc, "update the calendar event for", action="update_event")
+            self._report_failure(workspace_id, provider, exc, "update the calendar event for", action="update_event")
             return
-        self._report_success(workspace_id, "update_event")
+        self._report_success(workspace_id, provider, "update_event")
 
     def cancel_event(self, workspace_id: uuid.UUID, appointment: Appointment) -> None:
         if not appointment.external_calendar_event_id:
@@ -107,18 +113,19 @@ class CalendarSyncService:
         config = load_calendar_integration(self.db, workspace_id)
         if config is None:
             return
+        provider = self._provider_for(workspace_id)
         try:
-            self.provider.cancel_event(config.calendar_id, appointment.external_calendar_event_id)
+            provider.cancel_event(config.calendar_id, appointment.external_calendar_event_id)
         except CalendarError as exc:
-            self._report_failure(workspace_id, exc, "cancel the calendar event for", action="cancel_event")
+            self._report_failure(workspace_id, provider, exc, "cancel the calendar event for", action="cancel_event")
             return
         appointment.external_calendar_event_id = None
         appointment.external_calendar_provider = None
         self.db.add(appointment)
         self.db.commit()
-        self._report_success(workspace_id, "cancel_event")
+        self._report_success(workspace_id, provider, "cancel_event")
 
-    def _report_failure(self, workspace_id: uuid.UUID, exc: CalendarError, action_label: str, action: str) -> None:
+    def _report_failure(self, workspace_id: uuid.UUID, provider: CalendarProvider, exc: CalendarError, action_label: str, action: str) -> None:
         logger.error("workspace_id=%s failed to %s appointment: %s", workspace_id, action_label, exc, exc_info=True)
         message = _NON_FATAL_MESSAGES.get(type(exc), str(exc))
         notification = Notification(
@@ -130,12 +137,12 @@ class CalendarSyncService:
         self.db.add(notification)
         self.db.commit()
         record_integration_log(
-            self.db, workspace_id=workspace_id, category="calendar", provider=self.provider.name,
+            self.db, workspace_id=workspace_id, category="calendar", provider=provider.name,
             action=action, status="failure", detail=message,
         )
 
-    def _report_success(self, workspace_id: uuid.UUID, action: str) -> None:
+    def _report_success(self, workspace_id: uuid.UUID, provider: CalendarProvider, action: str) -> None:
         record_integration_log(
-            self.db, workspace_id=workspace_id, category="calendar", provider=self.provider.name,
+            self.db, workspace_id=workspace_id, category="calendar", provider=provider.name,
             action=action, status="success",
         )

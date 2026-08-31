@@ -7,6 +7,7 @@ from app.api import (
     auth,
     calls,
     health,
+    google_integrations,
     human_handoffs,
     leads,
     notifications,
@@ -21,6 +22,7 @@ from app.api import (
 api_router = APIRouter()
 api_router.include_router(health.router)
 api_router.include_router(auth.router)
+api_router.include_router(google_integrations.router)
 api_router.include_router(workspaces.router)
 api_router.include_router(patients.router)
 api_router.include_router(leads.router)

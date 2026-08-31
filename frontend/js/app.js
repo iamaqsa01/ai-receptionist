@@ -1821,6 +1821,7 @@
     { id: "scheduling", label: "Scheduling" },
     { id: "emergency", label: "Emergency" },
     { id: "ai", label: "AI preferences" },
+    { id: "integrations", label: "Integrations" },
     { id: "team", label: "Team" },
   ];
   const AGENT_TONES = ["Professional", "Empathetic", "Friendly"];
@@ -1860,7 +1861,7 @@
     const panel = $("#settings-panel", container);
     ({
       business: settingsBusiness, clinic: settingsClinicInfo, scheduling: settingsScheduling,
-      emergency: settingsEmergency, ai: settingsAi, team: settingsTeam,
+      emergency: settingsEmergency, ai: settingsAi, integrations: settingsIntegrations, team: settingsTeam,
     }[active] || settingsBusiness)(panel);
   }
 
@@ -2099,6 +2100,96 @@
         wireSave(panel, "s-ai", null,
           () => ClinicConfig.save({ agent_tone: $("#s-tone", panel).value, preferred_language: $("#s-lang", panel).value }));
       },
+    });
+  }
+
+  // -- Integrations ----------------------------------------------------
+  function settingsIntegrations(panel) {
+    let pollTimer = null;
+    let pollDeadline = 0;
+    onPageLeave(() => { if (pollTimer) clearInterval(pollTimer); });
+
+    const membership = (state.memberships || []).find((m) => m.workspace_id === state.workspace?.id);
+    const canManage = Boolean(state.user?.is_super_admin || ["owner", "admin"].includes(membership?.role));
+
+    const paint = (google) => {
+      const connected = Boolean(google.connected);
+      const connecting = google.status === "connecting";
+      const label = connected ? "Connected" : (connecting ? "Connecting" : "Disconnected");
+      const tone = connected ? "ok" : "warn";
+      const calendarName = google.calendar_name || google.calendar_id || "Google Calendar";
+      panel.innerHTML = settingsCard(
+        "Integrations",
+        "Connect this workspace to the clinic owner's Google Calendar.",
+        `<div class="integration-card">
+          <div class="integration-card__top">
+            <div class="integration-card__icon" aria-hidden="true"><strong style="font-size:20px;color:#4285f4;">G</strong></div>
+            <div class="integration-card__meta" style="flex:1;">
+              <div class="integration-card__name">Google Calendar</div>
+              <div class="integration-card__category">Appointment availability and event sync</div>
+            </div>
+            <span class="status-pill status-pill--${tone}"><span class="status-pill__dot"></span>${escapeHtml(label)}</span>
+          </div>
+          <div class="integration-card__detail">${connected ? `Calendar: <strong>${escapeHtml(calendarName)}</strong>${google.auth_type === "service_account" ? " · Service-account connection" : ""}` : "No Google account is connected to this workspace."}</div>
+          <div style="display:flex;gap:8px;align-items:center;">
+            ${canManage ? (connected
+              ? `<button class="btn btn--secondary btn--sm" id="google-disconnect">Disconnect</button>${google.auth_type === "service_account" ? `<button class="btn btn--primary btn--sm" id="google-connect">Connect clinic Google account</button>` : ""}`
+              : `<button class="btn btn--primary btn--sm" id="google-connect"${connecting ? " disabled" : ""}>${connecting ? "Waiting for Google…" : "Connect Google Calendar"}</button>`)
+              : `<span class="field__hint">Only workspace owners and admins can change integrations.</span>`}
+          </div>
+        </div>`
+      );
+
+      const connect = $("#google-connect", panel);
+      if (connect) connect.addEventListener("click", async () => {
+        const popup = window.open("about:blank", "google-calendar-oauth", "width=560,height=720,resizable=yes,scrollbars=yes");
+        connect.disabled = true;
+        try {
+          const result = await Api.integrations.googleConnect();
+          if (!popup) throw new Error("Your browser blocked the Google sign-in popup. Allow popups and try again.");
+          popup.location.href = result.authorization_url;
+          pollDeadline = Date.now() + 120000;
+          pollTimer = setInterval(async () => {
+            if (Date.now() > pollDeadline) {
+              clearInterval(pollTimer); pollTimer = null;
+              toast({ title: "Connection timed out", text: "Try connecting Google Calendar again.", tone: "warning" });
+              return;
+            }
+            try {
+              const latest = await Api.integrations.googleStatus();
+              if (latest.connected) {
+                clearInterval(pollTimer); pollTimer = null;
+                toast({ title: "Google Calendar connected", text: latest.calendar_name || "Calendar sync is active.", tone: "success" });
+                paint(latest);
+              }
+            } catch { /* keep polling while the consent window is active */ }
+          }, 1500);
+        } catch (err) {
+          if (popup && !popup.closed) popup.close();
+          connect.disabled = false;
+          toast({ title: "Couldn't connect Google Calendar", text: err.message || "Try again.", tone: "error" });
+        }
+      });
+
+      const disconnect = $("#google-disconnect", panel);
+      if (disconnect) disconnect.addEventListener("click", async () => {
+        if (!window.confirm("Disconnect Google Calendar for this workspace? Existing appointments will remain saved.")) return;
+        disconnect.disabled = true;
+        try {
+          await Api.integrations.googleDisconnect();
+          toast({ title: "Google Calendar disconnected", tone: "info" });
+          paint({ connected: false, status: "disconnected" });
+        } catch (err) {
+          disconnect.disabled = false;
+          toast({ title: "Couldn't disconnect", text: err.message || "Try again.", tone: "error" });
+        }
+      });
+    };
+
+    loadInto(panel, {
+      skeleton: skeletonRows(3, 1),
+      fetcher: () => Api.integrations.googleStatus(),
+      render: paint,
     });
   }
 
