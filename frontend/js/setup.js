@@ -36,6 +36,11 @@ window.ClinicOnboarding = (() => {
   // English and Roman Urdu for written channels. Do not add values here that
   // the backend enum does not accept.
   const LANGUAGES = ["English", "Urdu", "Roman Urdu", "Punjabi", "Saraiki", "Sindhi", "Pashto"];
+  // app/schemas/clinic_settings.py :: BusinessType. Drives the conditional
+  // "Business context" step and (server-side) whether the clinic onboarding
+  // requirements apply.
+  const BUSINESS_TYPES = ["Software Agency", "Clinic", "Real Estate", "Other"];
+  const URL_RE = /^https?:\/\/\S+$/i;
   const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
   const DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
   const ADDRESS_MAX = 500;   // GeneralInfo.address max_length
@@ -83,6 +88,15 @@ window.ClinicOnboarding = (() => {
         clinicName: "", phone: "", email: "", website: "",
         street: "", city: "", state: "", postal: "", country: "",
         googleMapsLink: "", timezone: browserTimezone(),
+      },
+      businessType: "",
+      // Per-type sub-state so switching business type keeps what was typed.
+      // Only the selected type's data is sent (see buildBusinessContextPayload).
+      bc: {
+        agency: { coreServices: [""], minimumPricing: "", discoveryLink: "" },
+        clinic: { appointmentLink: "" },
+        realEstate: { propertyServices: [""], areasServed: [""], minimumBudget: "", viewingLink: "" },
+        other: { customFields: [{ key: "", value: "" }] },
       },
       doctors: [newDoctor()],
       services: [""],
@@ -191,14 +205,29 @@ window.ClinicOnboarding = (() => {
   // =======================================================================
   const STEPS = [
     { id: "business", label: "Business Information", render: renderBusiness, collect: collectBusiness },
-    { id: "doctors", label: "Doctors", render: renderDoctors, collect: collectDoctors },
-    { id: "services", label: "Services", render: renderServices, collect: collectServices },
-    { id: "appointment", label: "Appointment Settings", render: renderAppointment, collect: collectAppointment },
+    { id: "context", label: "Business Context", render: renderBusinessContext, collect: collectBusinessContext },
+    { id: "doctors", label: "Doctors", render: renderDoctors, collect: collectDoctors, clinicOnly: true },
+    { id: "services", label: "Services", render: renderServices, collect: collectServices, clinicOnly: true },
+    { id: "appointment", label: "Appointment Settings", render: renderAppointment, collect: collectAppointment, clinicOnly: true },
     { id: "general", label: "General Information / FAQs", render: renderGeneral, collect: collectGeneral },
-    { id: "emergency", label: "Emergency Protocol", render: renderEmergency, collect: collectEmergency },
+    { id: "emergency", label: "Emergency Protocol", render: renderEmergency, collect: collectEmergency, clinicOnly: true },
     { id: "ai", label: "AI Preferences", render: renderAi, collect: collectAi },
     { id: "review", label: "Review & Confirm", render: renderReview, collect: () => ({ ok: true }) },
   ];
+  // Resolve a step's position by id so inserting a step never desynchronises
+  // the "Step N" eyebrows or the review "Edit" jump targets.
+  const stepIndex = (id) => STEPS.findIndex((s) => s.id === id);
+  const stepNo = (id) => stepIndex(id) + 1;
+
+  // Legacy payloads (no business_type) and an explicit "Clinic" keep the full
+  // clinic wizard (doctors / services / hours / emergency). Software Agency /
+  // Real Estate / Other skip those steps — the backend gate is relaxed to
+  // match (app/api/workspaces.py).
+  const isClinicFlow = () => !model.businessType || model.businessType === "Clinic";
+  const stepEnabled = (i) => !STEPS[i].clinicOnly || isClinicFlow();
+  const enabledSteps = () => STEPS.map((_, i) => i).filter(stepEnabled);
+  function nextEnabled(from) { for (let i = from + 1; i < STEPS.length; i++) if (stepEnabled(i)) return i; return from; }
+  function prevEnabled(from) { for (let i = from - 1; i >= 0; i--) if (stepEnabled(i)) return i; return from; }
 
   // =======================================================================
   // Shell / navigation
@@ -251,13 +280,16 @@ window.ClinicOnboarding = (() => {
     const rail = $("#ob-rail", screenEl);
     // wipe everything after the title
     $$(".onboard-step-btn", rail).forEach((n) => n.remove());
+    const enabled = enabledSteps();
     STEPS.forEach((s, i) => {
+      if (!stepEnabled(i)) return; // clinic-only step hidden for non-clinic types
+      const num = enabled.indexOf(i) + 1;
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "onboard-step-btn";
       btn.dataset.idx = String(i);
-      btn.setAttribute("aria-label", `Step ${i + 1} of ${STEPS.length}: ${s.label}`);
-      btn.innerHTML = `<span class="onboard-step-btn__num" aria-hidden="true">${i + 1}</span><span class="onboard-step-btn__label">${esc(s.label)}</span>`;
+      btn.setAttribute("aria-label", `Step ${num} of ${enabled.length}: ${s.label}`);
+      btn.innerHTML = `<span class="onboard-step-btn__num" aria-hidden="true">${num}</span><span class="onboard-step-btn__label">${esc(s.label)}</span>`;
       btn.disabled = !visited.has(i);
       btn.addEventListener("click", () => jumpTo(i));
       rail.appendChild(btn);
@@ -274,10 +306,17 @@ window.ClinicOnboarding = (() => {
       btn.disabled = !visited.has(i);
       if (active) btn.setAttribute("aria-current", "step"); else btn.removeAttribute("aria-current");
     });
-    $("#ob-stepcount", screenEl).textContent = `Step ${currentStep + 1} of ${STEPS.length} — ${STEPS[currentStep].label}`;
-    $("#ob-progress", screenEl).style.width = `${((currentStep + 1) / STEPS.length) * 100}%`;
+    const enabled = enabledSteps();
+    const pos = enabled.indexOf(currentStep) + 1;
+    const total = enabled.length;
+    $("#ob-stepcount", screenEl).textContent = `Step ${pos} of ${total} — ${STEPS[currentStep].label}`;
+    $("#ob-progress", screenEl).style.width = `${(pos / total) * 100}%`;
     const pb = $("#ob-progressbar", screenEl);
-    if (pb) { pb.setAttribute("aria-valuenow", String(currentStep + 1)); pb.setAttribute("aria-valuetext", `Step ${currentStep + 1} of ${STEPS.length}: ${STEPS[currentStep].label}`); }
+    if (pb) {
+      pb.setAttribute("aria-valuemax", String(total));
+      pb.setAttribute("aria-valuenow", String(pos));
+      pb.setAttribute("aria-valuetext", `Step ${pos} of ${total}: ${STEPS[currentStep].label}`);
+    }
     const backBtn = $("#ob-back", screenEl);
     backBtn.style.visibility = currentStep === 0 ? "hidden" : "visible";
     const nextLabel = $("#ob-next .btn__label", screenEl);
@@ -289,7 +328,7 @@ window.ClinicOnboarding = (() => {
     const host = $("#ob-step", screenEl);
     host.innerHTML = "";
     STEPS[currentStep].render(host);
-    syncRail();
+    buildRail(); // rebuild so a Business Type change adds/removes clinic steps
     // Reset the scroll of the step pane and move focus into it for screen
     // readers / keyboard users (each step is a fresh view).
     const content = $(".onboard-content", screenEl);
@@ -297,19 +336,22 @@ window.ClinicOnboarding = (() => {
     host.focus({ preventScroll: true });
   }
 
-  function goBack() { if (currentStep > 0) { currentStep--; visited.add(currentStep); renderStep(); } }
+  function goBack() {
+    const prev = prevEnabled(currentStep);
+    if (prev !== currentStep) { currentStep = prev; visited.add(currentStep); renderStep(); }
+  }
 
   function goNext() {
     const res = STEPS[currentStep].collect();
     if (res && res.error) { showError(res.error); return; }
     if (currentStep === STEPS.length - 1) { submit(); return; }
-    currentStep++;
+    currentStep = nextEnabled(currentStep);
     visited.add(currentStep);
     renderStep();
   }
 
   function jumpTo(i) {
-    if (!visited.has(i)) return;
+    if (!visited.has(i) || !stepEnabled(i)) return;
     // Save whatever's on the current step (best-effort) before leaving it,
     // but don't block navigation to an already-visited step on validation.
     try { STEPS[currentStep].collect(); } catch { /* ignore */ }
@@ -332,7 +374,7 @@ window.ClinicOnboarding = (() => {
   function renderBusiness(host) {
     const b = model.business;
     host.innerHTML = `
-      ${stepHead("Step 1", "Business information", "Tell us about your clinic. The AI receptionist uses this to answer callers.")}
+      ${stepHead(`Step ${stepNo("business")}`, "Business information", "Tell us about your clinic. The AI receptionist uses this to answer callers.")}
       <div class="onboard-fieldset">
         <div class="onboard-fieldset__legend">Organisation</div>
         <div class="onboard-grid">
@@ -433,11 +475,288 @@ window.ClinicOnboarding = (() => {
   }
 
   // =======================================================================
-  // STEP 2 — Doctors (dynamic add / edit / remove)
+  // STEP 2 — Business context (dynamic, driven by Business Type)
+  // Maps to ClinicSettingsUpdate.business_type + .business_context. Only the
+  // fields for the chosen type are sent; Clinic derives doctor specialisations
+  // from the Doctors step and its hours from the Appointment Settings step.
+  // =======================================================================
+  const isUrl = (v) => URL_RE.test(trim(v));
+  const uniqList = (arr) => {
+    const cleaned = arr.map(trim).filter(Boolean);
+    return { cleaned, unique: new Set(cleaned.map((s) => s.toLocaleLowerCase())).size === cleaned.length };
+  };
+
+  function derivedDoctorSpecializations() {
+    const out = [];
+    const seen = new Set();
+    (model.doctors || []).forEach((d) => {
+      const s = trim(d.specialty);
+      const k = s.toLocaleLowerCase();
+      if (s && !seen.has(k)) { seen.add(k); out.push(s); }
+    });
+    return out;
+  }
+
+  function renderBusinessContext(host) {
+    host.innerHTML = `
+      ${stepHead(`Step ${stepNo("context")}`, "Business context", "Tell the AI receptionist what kind of business this is. The follow-up questions adapt to your answer.")}
+      <div class="onboard-fieldset">
+        <div class="onboard-fieldset__legend">Business type</div>
+        <div class="field span-2">
+          <label class="field__label" for="bc-type">Business type <span class="req" aria-hidden="true">*</span></label>
+          <select class="select" id="bc-type" required aria-required="true">
+            <option value=""${!model.businessType ? " selected" : ""}>— Select a business type —</option>
+            ${BUSINESS_TYPES.map((t) => `<option value="${esc(t)}"${model.businessType === t ? " selected" : ""}>${esc(t)}</option>`).join("")}
+          </select>
+        </div>
+      </div>
+      <div id="bc-fields"></div>`;
+    $("#bc-type", host).addEventListener("change", (e) => {
+      model.businessType = e.target.value;
+      paintBusinessContextFields(host);
+    });
+    paintBusinessContextFields(host);
+  }
+
+  // Reusable "list of strings" editor (add / edit / remove). `arr` is a live
+  // reference into model.bc.*; a remove repaints the whole step (existing
+  // pattern — see paintServices).
+  function paintStringList(host, selector, arr, label, placeholder) {
+    const wrap = $(selector, host);
+    if (!arr.length) arr.push("");
+    wrap.innerHTML = arr.map((v, i) => `
+      <div class="onboard-inline-row" data-sl="${i}">
+        <div class="field"><input class="input" data-f="v" value="${esc(v)}" placeholder="${esc(placeholder)}" maxlength="255" aria-label="${esc(label)} ${i + 1}" /></div>
+        <button class="btn btn--ghost btn--sm" type="button" data-remove-sl="${i}" aria-label="Remove ${esc(label.toLowerCase())} ${i + 1}">Remove</button>
+      </div>`).join("");
+    $$("[data-sl]", wrap).forEach((row) => {
+      const i = Number(row.dataset.sl);
+      $('[data-f="v"]', row).addEventListener("input", (e) => { arr[i] = e.target.value; });
+      $("[data-remove-sl]", row).addEventListener("click", () => {
+        arr.splice(i, 1);
+        if (!arr.length) arr.push("");
+        paintBusinessContextFields(host);
+      });
+    });
+  }
+
+  function paintCustomFields(host) {
+    const wrap = $("#bc-other-fields", host);
+    const rows = model.bc.other.customFields;
+    if (!rows.length) rows.push({ key: "", value: "" });
+    wrap.innerHTML = rows.map((f, i) => `
+      <div class="onboard-inline-row" data-cf="${i}">
+        <div class="field">
+          <label class="field__label" for="bc-cf-k-${i}">Key <span class="req" aria-hidden="true">*</span></label>
+          <input class="input" id="bc-cf-k-${i}" data-f="key" value="${esc(f.key)}" placeholder="e.g. Industry" maxlength="100" />
+        </div>
+        <div class="field">
+          <label class="field__label" for="bc-cf-v-${i}">Value <span class="req" aria-hidden="true">*</span></label>
+          <input class="input" id="bc-cf-v-${i}" data-f="value" value="${esc(f.value)}" placeholder="e.g. Legal Services" maxlength="1000" />
+        </div>
+        <button class="btn btn--ghost btn--sm" type="button" data-remove-cf="${i}" aria-label="Remove custom field ${i + 1}">Remove</button>
+      </div>`).join("");
+    $$("[data-cf]", wrap).forEach((row) => {
+      const i = Number(row.dataset.cf);
+      $$("[data-f]", row).forEach((inp) => inp.addEventListener("input", (e) => { rows[i][e.target.dataset.f] = e.target.value; }));
+      $("[data-remove-cf]", row).addEventListener("click", () => {
+        rows.splice(i, 1);
+        if (!rows.length) rows.push({ key: "", value: "" });
+        paintBusinessContextFields(host);
+      });
+    });
+  }
+
+  function paintBusinessContextFields(host) {
+    const wrap = $("#bc-fields", host);
+    const t = model.businessType;
+    const bc = model.bc;
+    if (!t) { wrap.innerHTML = `<div class="onboard-hint">Choose a business type above to see the questions for it.</div>`; return; }
+
+    if (t === "Software Agency") {
+      wrap.innerHTML = `
+        <div class="onboard-fieldset">
+          <div class="onboard-fieldset__legend">Software agency details</div>
+          <div class="field span-2">
+            <span class="field__label">Core services <span class="req" aria-hidden="true">*</span></span>
+            <div id="bc-agency-services"></div>
+            <button class="btn btn--secondary btn--sm onboard-add-btn" type="button" id="bc-add-agency-service">+ Add service</button>
+          </div>
+          <div class="onboard-grid" style="margin-top:16px;">
+            <div class="field">
+              <label class="field__label" for="bc-agency-price">Minimum pricing / budget <span class="req" aria-hidden="true">*</span></label>
+              <input class="input" id="bc-agency-price" value="${esc(bc.agency.minimumPricing)}" placeholder="e.g. $1,000 or PKR 150,000" maxlength="120" />
+            </div>
+            <div class="field">
+              <label class="field__label" for="bc-agency-link">Discovery call booking link <span class="req" aria-hidden="true">*</span></label>
+              <input class="input" id="bc-agency-link" type="url" inputmode="url" value="${esc(bc.agency.discoveryLink)}" placeholder="https://cal.com/you/discovery" maxlength="500" />
+            </div>
+          </div>
+        </div>`;
+      paintStringList(host, "#bc-agency-services", bc.agency.coreServices, "Core service", "e.g. Web Development");
+      $("#bc-add-agency-service", host).addEventListener("click", () => { bc.agency.coreServices.push(""); paintBusinessContextFields(host); });
+      $("#bc-agency-price", host).addEventListener("input", (e) => { bc.agency.minimumPricing = e.target.value; });
+      $("#bc-agency-link", host).addEventListener("input", (e) => { bc.agency.discoveryLink = e.target.value; });
+    } else if (t === "Clinic") {
+      const specs = derivedDoctorSpecializations();
+      wrap.innerHTML = `
+        <div class="onboard-fieldset">
+          <div class="onboard-fieldset__legend">Clinic details</div>
+          <div class="field span-2">
+            <span class="field__label">Doctor specializations</span>
+            <div class="onboard-hint">Taken automatically from the Doctors step — ${specs.length ? esc(specs.join(", ")) : "add a specialty to each doctor there and it will appear here."}</div>
+          </div>
+          <div class="field span-2" style="margin-top:12px;">
+            <span class="field__label">Clinic timings</span>
+            <div class="onboard-hint">Configured in the Appointment Settings step (business hours) — not duplicated here.</div>
+          </div>
+          <div class="field span-2" style="margin-top:12px;">
+            <label class="field__label" for="bc-clinic-link">Appointment booking link</label>
+            <input class="input" id="bc-clinic-link" type="url" inputmode="url" value="${esc(bc.clinic.appointmentLink)}" placeholder="https://your-clinic.com/book (optional)" maxlength="500" />
+          </div>
+        </div>`;
+      $("#bc-clinic-link", host).addEventListener("input", (e) => { bc.clinic.appointmentLink = e.target.value; });
+    } else if (t === "Real Estate") {
+      wrap.innerHTML = `
+        <div class="onboard-fieldset">
+          <div class="onboard-fieldset__legend">Real estate details</div>
+          <div class="field span-2">
+            <span class="field__label">Property services <span class="req" aria-hidden="true">*</span></span>
+            <div id="bc-re-services"></div>
+            <button class="btn btn--secondary btn--sm onboard-add-btn" type="button" id="bc-add-re-service">+ Add service</button>
+          </div>
+          <div class="field span-2" style="margin-top:16px;">
+            <span class="field__label">Areas / locations served <span class="req" aria-hidden="true">*</span></span>
+            <div id="bc-re-areas"></div>
+            <button class="btn btn--secondary btn--sm onboard-add-btn" type="button" id="bc-add-re-area">+ Add area</button>
+          </div>
+          <div class="onboard-grid" style="margin-top:16px;">
+            <div class="field">
+              <label class="field__label" for="bc-re-budget">Minimum budget <span class="req" aria-hidden="true">*</span></label>
+              <input class="input" id="bc-re-budget" value="${esc(bc.realEstate.minimumBudget)}" placeholder="e.g. PKR 10,000,000" maxlength="120" />
+            </div>
+            <div class="field">
+              <label class="field__label" for="bc-re-link">Viewing booking link <span class="req" aria-hidden="true">*</span></label>
+              <input class="input" id="bc-re-link" type="url" inputmode="url" value="${esc(bc.realEstate.viewingLink)}" placeholder="https://calendly.com/you/viewing" maxlength="500" />
+            </div>
+          </div>
+        </div>`;
+      paintStringList(host, "#bc-re-services", bc.realEstate.propertyServices, "Property service", "e.g. Residential Sales");
+      paintStringList(host, "#bc-re-areas", bc.realEstate.areasServed, "Area", "e.g. DHA Phase 5");
+      $("#bc-add-re-service", host).addEventListener("click", () => { bc.realEstate.propertyServices.push(""); paintBusinessContextFields(host); });
+      $("#bc-add-re-area", host).addEventListener("click", () => { bc.realEstate.areasServed.push(""); paintBusinessContextFields(host); });
+      $("#bc-re-budget", host).addEventListener("input", (e) => { bc.realEstate.minimumBudget = e.target.value; });
+      $("#bc-re-link", host).addEventListener("input", (e) => { bc.realEstate.viewingLink = e.target.value; });
+    } else if (t === "Other") {
+      if (!bc.other.customFields.length) bc.other.customFields = [{ key: "", value: "" }];
+      wrap.innerHTML = `
+        <div class="onboard-fieldset">
+          <div class="onboard-fieldset__legend">Custom context</div>
+          <div class="onboard-hint" style="margin-bottom:10px;">Add any key/value details the AI receptionist should know. Keys must be unique and non-blank.</div>
+          <div id="bc-other-fields"></div>
+          <button class="btn btn--secondary btn--sm onboard-add-btn" type="button" id="bc-add-other">+ Add field</button>
+        </div>`;
+      paintCustomFields(host);
+      $("#bc-add-other", host).addEventListener("click", () => { bc.other.customFields.push({ key: "", value: "" }); paintBusinessContextFields(host); });
+    }
+  }
+
+  function collectBusinessContext() {
+    const t = model.businessType;
+    if (!BUSINESS_TYPES.includes(t)) return { error: "Please choose your business type." };
+    const bc = model.bc;
+
+    if (t === "Software Agency") {
+      const svc = uniqList(bc.agency.coreServices);
+      if (!svc.cleaned.length) return { error: "Add at least one core service." };
+      if (!svc.unique) return { error: "Core services must be unique." };
+      if (!trim(bc.agency.minimumPricing)) return { error: "Enter your minimum pricing or budget." };
+      if (!trim(bc.agency.discoveryLink)) return { error: "Enter your discovery call booking link." };
+      if (!isUrl(bc.agency.discoveryLink)) return { error: "The discovery call booking link must start with http:// or https://" };
+      bc.agency.coreServices = svc.cleaned;
+    } else if (t === "Clinic") {
+      if (trim(bc.clinic.appointmentLink) && !isUrl(bc.clinic.appointmentLink)) {
+        return { error: "The appointment booking link must start with http:// or https://" };
+      }
+      // doctor_specializations is derived from the Doctors step; clinic hours
+      // come from Appointment Settings — nothing else to validate here.
+    } else if (t === "Real Estate") {
+      const svc = uniqList(bc.realEstate.propertyServices);
+      const areas = uniqList(bc.realEstate.areasServed);
+      if (!svc.cleaned.length) return { error: "Add at least one property service." };
+      if (!svc.unique) return { error: "Property services must be unique." };
+      if (!areas.cleaned.length) return { error: "Add at least one area served." };
+      if (!areas.unique) return { error: "Areas served must be unique." };
+      if (!trim(bc.realEstate.minimumBudget)) return { error: "Enter your minimum budget." };
+      if (!trim(bc.realEstate.viewingLink)) return { error: "Enter your viewing booking link." };
+      if (!isUrl(bc.realEstate.viewingLink)) return { error: "The viewing booking link must start with http:// or https://" };
+      bc.realEstate.propertyServices = svc.cleaned;
+      bc.realEstate.areasServed = areas.cleaned;
+    } else if (t === "Other") {
+      const rows = bc.other.customFields.map((f) => ({ key: trim(f.key), value: trim(f.value) }));
+      const nonEmpty = rows.filter((f) => f.key || f.value);
+      if (!nonEmpty.length) return { error: "Add at least one custom field." };
+      for (const f of nonEmpty) {
+        if (!f.key) return { error: "Every custom field needs a key." };
+        if (!f.value) return { error: `The “${f.key}” custom field needs a value.` };
+      }
+      const keys = nonEmpty.map((f) => f.key.toLocaleLowerCase());
+      if (new Set(keys).size !== keys.length) return { error: "Custom field keys must be unique." };
+      bc.other.customFields = nonEmpty;
+    }
+    return { ok: true };
+  }
+
+  // model.bc + business type  ->  { business_type, business_context } (only the
+  // keys for the chosen type, and only non-empty ones). Returns {} when no
+  // type is chosen so the payload stays legacy-compatible.
+  function buildBusinessContextPayload() {
+    const t = model.businessType;
+    if (!BUSINESS_TYPES.includes(t)) return {};
+    const bc = model.bc;
+    let context = {};
+    if (t === "Software Agency") {
+      context = {
+        core_services: bc.agency.coreServices.map(trim).filter(Boolean),
+        minimum_pricing: trim(bc.agency.minimumPricing),
+        discovery_call_booking_link: trim(bc.agency.discoveryLink),
+      };
+    } else if (t === "Clinic") {
+      context = {
+        doctor_specializations: derivedDoctorSpecializations(),
+        appointment_booking_link: trim(bc.clinic.appointmentLink),
+      };
+    } else if (t === "Real Estate") {
+      context = {
+        property_services: bc.realEstate.propertyServices.map(trim).filter(Boolean),
+        areas_served: bc.realEstate.areasServed.map(trim).filter(Boolean),
+        minimum_budget: trim(bc.realEstate.minimumBudget),
+        viewing_booking_link: trim(bc.realEstate.viewingLink),
+      };
+    } else if (t === "Other") {
+      const cf = {};
+      bc.other.customFields.forEach((f) => {
+        const k = trim(f.key), v = trim(f.value);
+        if (k && v) cf[k] = v;
+      });
+      context = { custom_fields: cf };
+    }
+    const business_context = {};
+    Object.entries(context).forEach(([k, v]) => {
+      if (v == null || v === "") return;
+      if (Array.isArray(v) && v.length === 0) return;
+      if (!Array.isArray(v) && typeof v === "object" && Object.keys(v).length === 0) return;
+      business_context[k] = v;
+    });
+    return { business_type: t, business_context };
+  }
+
+  // =======================================================================
+  // STEP 3 — Doctors (dynamic add / edit / remove)
   // =======================================================================
   function renderDoctors(host) {
     host.innerHTML = `
-      ${stepHead("Step 2", "Doctors", "Add every doctor callers can book with. You can add as many as you need.")}
+      ${stepHead(`Step ${stepNo("doctors")}`, "Doctors", "Add every doctor callers can book with. You can add as many as you need.")}
       <div id="ob-doctors"></div>
       <button class="btn btn--secondary btn--sm onboard-add-btn" id="ob-add-doctor" type="button">+ Add doctor</button>`;
     paintDoctors(host);
@@ -530,7 +849,7 @@ window.ClinicOnboarding = (() => {
   // =======================================================================
   function renderServices(host) {
     host.innerHTML = `
-      ${stepHead("Step 3", "Services", "List the services or procedures your clinic offers. Callers can ask about and book these.")}
+      ${stepHead(`Step ${stepNo("services")}`, "Services", "List the services or procedures your clinic offers. Callers can ask about and book these.")}
       <div id="ob-services"></div>
       <button class="btn btn--secondary btn--sm onboard-add-btn" id="ob-add-service" type="button">+ Add service</button>`;
     paintServices(host);
@@ -573,7 +892,7 @@ window.ClinicOnboarding = (() => {
   function renderAppointment(host) {
     const a = model.appointment;
     host.innerHTML = `
-      ${stepHead("Step 4", "Appointment settings", "How the AI receptionist schedules bookings.")}
+      ${stepHead(`Step ${stepNo("appointment")}`, "Appointment settings", "How the AI receptionist schedules bookings.")}
       <div class="onboard-grid">
         <div class="field">
           <label class="field__label" for="a-slot">Default slot duration (minutes) *</label>
@@ -650,7 +969,7 @@ window.ClinicOnboarding = (() => {
   function renderGeneral(host) {
     const g = model.general;
     host.innerHTML = `
-      ${stepHead("Step 5", "General information & FAQs", "Extra details the AI receptionist can share with callers.")}
+      ${stepHead(`Step ${stepNo("general")}`, "General information & FAQs", "Extra details the AI receptionist can share with callers.")}
       <div class="onboard-fieldset">
         <div class="onboard-fieldset__legend">Practical details</div>
         <div class="onboard-grid">
@@ -769,7 +1088,7 @@ window.ClinicOnboarding = (() => {
   // =======================================================================
   function renderEmergency(host) {
     host.innerHTML = `
-      ${stepHead("Step 6", "Emergency protocol", "The exact operational instructions the AI receptionist must follow when a caller reports a medical emergency.")}
+      ${stepHead(`Step ${stepNo("emergency")}`, "Emergency protocol", "The exact operational instructions the AI receptionist must follow when a caller reports a medical emergency.")}
       <div class="field">
         <label class="field__label" for="e-text">Emergency instructions *</label>
         <textarea class="textarea" id="e-text" style="min-height:150px;" maxlength="${EMERGENCY_MAX}" required aria-required="true"
@@ -794,7 +1113,7 @@ window.ClinicOnboarding = (() => {
   // =======================================================================
   function renderAi(host) {
     host.innerHTML = `
-      ${stepHead("Step 7", "AI preferences", "How your AI receptionist sounds and which language it speaks by default.")}
+      ${stepHead(`Step ${stepNo("ai")}`, "AI preferences", "How your AI receptionist sounds and which language it speaks by default.")}
       <div class="onboard-grid">
         <div class="field">
           <label class="field__label" for="ai-tone">Tone</label>
@@ -835,9 +1154,9 @@ window.ClinicOnboarding = (() => {
       <dd class="${value ? "" : "is-empty"}">${value ? esc(value) : "—"}</dd></div>`;
 
     host.innerHTML = `
-      ${stepHead("Step 8", "Review & confirm", `Check everything below${ctx.workspaceName ? ` for “${ctx.workspaceName}”` : ""}. Use Edit on any section to go back and change it.`)}
+      ${stepHead(`Step ${stepNo("review")}`, "Review & confirm", `Check everything below${ctx.workspaceName ? ` for “${ctx.workspaceName}”` : ""}. Use Edit on any section to go back and change it.`)}
 
-      ${reviewSection("Business information", 0, `
+      ${reviewSection("Business information", stepIndex("business"), `
         ${row("Clinic name", b.clinicName)}
         ${row("Phone", b.phone)}
         ${row("Email", b.email)}
@@ -846,32 +1165,34 @@ window.ClinicOnboarding = (() => {
         ${row("Google Maps", b.googleMapsLink)}
       `)}
 
-      ${reviewSection("Timezone", 0, row("Timezone", window.TZ ? TZ.label(b.timezone) : b.timezone))}
+      ${reviewSection("Timezone", stepIndex("business"), row("Timezone", window.TZ ? TZ.label(b.timezone) : b.timezone))}
 
-      ${reviewSection("Doctors", 1, model.doctors.map((d, i) => `
-        <div class="onboard-review-row"><dt>Doctor ${i + 1}</dt><dd>${esc(d.name || "—")}${d.specialty ? " · " + esc(d.specialty) : ""}${d.fee !== "" ? " · fee " + esc(d.fee) : ""}${composeTimings(d) ? " · " + esc(composeTimings(d)) : ""}</dd></div>`).join(""))}
+      ${reviewSection("Business context", stepIndex("context"), reviewBusinessContext())}
 
-      ${reviewSection("Services", 2, `<ul class="onboard-review-list">${model.services.map((s) => `<li>${esc(s)}</li>`).join("") || "<li>—</li>"}</ul>`)}
+      ${isClinicFlow() ? reviewSection("Doctors", stepIndex("doctors"), model.doctors.map((d, i) => `
+        <div class="onboard-review-row"><dt>Doctor ${i + 1}</dt><dd>${esc(d.name || "—")}${d.specialty ? " · " + esc(d.specialty) : ""}${d.fee !== "" ? " · fee " + esc(d.fee) : ""}${composeTimings(d) ? " · " + esc(composeTimings(d)) : ""}</dd></div>`).join("")) : ""}
 
-      ${reviewSection("Appointment settings", 3, `
+      ${isClinicFlow() ? reviewSection("Services", stepIndex("services"), `<ul class="onboard-review-list">${model.services.map((s) => `<li>${esc(s)}</li>`).join("") || "<li>—</li>"}</ul>`) : ""}
+
+      ${isClinicFlow() ? reviewSection("Appointment settings", stepIndex("appointment"), `
         ${row("Slot duration", model.appointment.slotMinutes + " minutes")}
         ${row("Max daily bookings", model.appointment.maxDaily || "No limit")}
-      `)}
+      `) : ""}
 
-      ${reviewSection("General information", 4, `
+      ${reviewSection("General information", stepIndex("general"), `
         ${row("Parking", g.parking === "yes" ? "Available on site" : g.parking === "no" ? "Not available" : "")}
         ${row("Opening hours", g.openingHours)}
         ${row("Payment methods", g.paymentMethods.join(", "))}
         ${row("General notes", g.generalNotes)}
       `)}
 
-      ${reviewSection("FAQs", 4, g.faqs.length
+      ${reviewSection("FAQs", stepIndex("general"), g.faqs.length
         ? `<ul class="onboard-review-list">${g.faqs.map((f) => `<li><strong>${esc(f.q)}</strong> — ${esc(f.a)}</li>`).join("")}</ul>`
         : row("FAQs", ""))}
 
-      ${reviewSection("Emergency protocol", 5, row("Instructions", model.emergency))}
+      ${isClinicFlow() ? reviewSection("Emergency protocol", stepIndex("emergency"), row("Instructions", model.emergency)) : ""}
 
-      ${reviewSection("AI preferences", 6, `
+      ${reviewSection("AI preferences", stepIndex("ai"), `
         ${row("Tone", model.ai.tone)}
         ${row("Preferred language", model.ai.language)}
       `)}
@@ -897,6 +1218,37 @@ ${esc(JSON.stringify(payload, null, 2))}</pre>
         </div>
         <div class="onboard-review-section__body"><dl style="margin:0;">${bodyHtml}</dl></div>
       </div>`;
+  }
+
+  // Human-readable summary of whatever business_context will be sent.
+  function reviewBusinessContext() {
+    const { business_type: t, business_context: c } = buildBusinessContextPayload();
+    const row = (label, value) => `
+      <div class="onboard-review-row"><dt>${esc(label)}</dt>
+      <dd class="${value ? "" : "is-empty"}">${value ? esc(value) : "—"}</dd></div>`;
+    if (!t) return row("Business type", "");
+    const rows = [row("Business type", t)];
+    if (t === "Software Agency") {
+      rows.push(row("Core services", (c.core_services || []).join(", ")));
+      rows.push(row("Minimum pricing / budget", c.minimum_pricing || ""));
+      rows.push(row("Discovery call booking link", c.discovery_call_booking_link || ""));
+    } else if (t === "Clinic") {
+      rows.push(row("Doctor specializations (from Doctors step)", (c.doctor_specializations || []).join(", ")));
+      rows.push(row("Clinic timings", "From the Appointment Settings step"));
+      rows.push(row("Appointment booking link", c.appointment_booking_link || ""));
+    } else if (t === "Real Estate") {
+      rows.push(row("Property services", (c.property_services || []).join(", ")));
+      rows.push(row("Areas served", (c.areas_served || []).join(", ")));
+      rows.push(row("Minimum budget", c.minimum_budget || ""));
+      rows.push(row("Viewing booking link", c.viewing_booking_link || ""));
+    } else if (t === "Other") {
+      const cf = c.custom_fields || {};
+      const keys = Object.keys(cf);
+      rows.push(keys.length
+        ? `<div class="onboard-review-row"><dt>Custom context</dt><dd><ul class="onboard-review-list">${keys.map((k) => `<li><strong>${esc(k)}</strong> — ${esc(cf[k])}</li>`).join("")}</ul></dd></div>`
+        : row("Custom context", ""));
+    }
+    return rows.join("");
   }
 
   // =======================================================================
@@ -946,7 +1298,8 @@ ${esc(JSON.stringify(payload, null, 2))}</pre>
   function buildClinicPayload() {
     const b = model.business;
     const g = model.general;
-    const doctors = model.doctors
+    const clinicFlow = isClinicFlow();
+    const doctors = clinicFlow ? model.doctors
       .filter((d) => trim(d.name))
       .map((d) => {
         const timings = composeTimings(d);
@@ -957,20 +1310,25 @@ ${esc(JSON.stringify(payload, null, 2))}</pre>
           timings: timings || null,
           consultation_fee: fee === null || Number.isNaN(fee) ? null : fee,
         };
-      });
+      }) : [];
 
     const address = composeAddress();
     const maxDaily = toNumberOrNull(model.appointment.maxDaily);
 
     return {
+      // {} when no business type is chosen (legacy-compatible); otherwise
+      // business_type + a business_context holding only the keys for that type.
+      ...buildBusinessContextPayload(),
       doctors,
-      services: model.services.map(trim).filter(Boolean),
-      business_hours: model.businessHours.map((hours) => ({
+      // Non-clinic business types skip the clinic steps entirely — send empty
+      // scheduling structures (the backend gate is relaxed to allow it).
+      services: clinicFlow ? model.services.map(trim).filter(Boolean) : [],
+      business_hours: clinicFlow ? model.businessHours.map((hours) => ({
         day_of_week: hours.dayOfWeek,
         open_time: hours.isClosed ? null : hours.openTime,
         close_time: hours.isClosed ? null : hours.closeTime,
         is_closed: hours.isClosed,
-      })),
+      })) : [],
       appointment_settings: {
         default_slot_duration_minutes: Math.round(Number(model.appointment.slotMinutes) || 30),
         max_daily_bookings: maxDaily === null || Number.isNaN(maxDaily) ? null : Math.round(maxDaily),
@@ -1030,6 +1388,34 @@ ${esc(JSON.stringify(payload, null, 2))}</pre>
     if (s.emergency_protocol) model.emergency = s.emergency_protocol;
     if (s.agent_tone && TONES.includes(s.agent_tone)) model.ai.tone = s.agent_tone;
     if (s.preferred_language && LANGUAGES.includes(s.preferred_language)) model.ai.language = s.preferred_language;
+
+    hydrateBusinessContext(s);
+  }
+
+  // Load a previously-saved business_type / business_context back into the
+  // per-type model.bc sub-state so re-entering the wizard shows real data.
+  function hydrateBusinessContext(s) {
+    if (!BUSINESS_TYPES.includes(s.business_type)) return;
+    model.businessType = s.business_type;
+    const c = s.business_context || {};
+    const bc = model.bc;
+    if (s.business_type === "Software Agency") {
+      if (Array.isArray(c.core_services) && c.core_services.length) bc.agency.coreServices = c.core_services.slice();
+      if (c.minimum_pricing) bc.agency.minimumPricing = c.minimum_pricing;
+      if (c.discovery_call_booking_link) bc.agency.discoveryLink = c.discovery_call_booking_link;
+    } else if (s.business_type === "Clinic") {
+      if (c.appointment_booking_link) bc.clinic.appointmentLink = c.appointment_booking_link;
+      // doctor_specializations is re-derived from the Doctors step on save.
+    } else if (s.business_type === "Real Estate") {
+      if (Array.isArray(c.property_services) && c.property_services.length) bc.realEstate.propertyServices = c.property_services.slice();
+      if (Array.isArray(c.areas_served) && c.areas_served.length) bc.realEstate.areasServed = c.areas_served.slice();
+      if (c.minimum_budget) bc.realEstate.minimumBudget = c.minimum_budget;
+      if (c.viewing_booking_link) bc.realEstate.viewingLink = c.viewing_booking_link;
+    } else if (s.business_type === "Other") {
+      const cf = c.custom_fields && typeof c.custom_fields === "object" ? c.custom_fields : {};
+      const rows = Object.keys(cf).map((k) => ({ key: k, value: String(cf[k] ?? "") }));
+      bc.other.customFields = rows.length ? rows : [{ key: "", value: "" }];
+    }
   }
 
   function parseComposedAddress(str) {
@@ -1061,8 +1447,9 @@ ${esc(JSON.stringify(payload, null, 2))}</pre>
   async function submit() {
     showError("");
 
-    // Full validation of every step before we touch the network.
+    // Full validation of every enabled step before we touch the network.
     for (let i = 0; i < STEPS.length - 1; i++) {
+      if (!stepEnabled(i)) continue;
       const res = STEPS[i].collect();
       if (res && res.error) {
         currentStep = i;

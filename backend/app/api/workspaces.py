@@ -11,7 +11,7 @@ from app.models.ai_agent import AIAgent
 from app.models.user import User
 from app.models.workspace import Workspace
 from app.models.workspace_member import WorkspaceMember
-from app.schemas.clinic_settings import ClinicSettingsOut, ClinicSettingsUpdate
+from app.schemas.clinic_settings import BusinessType, ClinicSettingsOut, ClinicSettingsUpdate
 from app.schemas.workspace import (
     MemberInvite,
     MemberOut,
@@ -145,11 +145,18 @@ def update_clinic_settings(
     if workspace is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
 
-    # A workspace is only ready for real booking once every normalized
+    # A clinic workspace is only ready for real booking once every normalized
     # scheduling resource can be created. Existing/onboarded workspaces may
-    # still save partial settings for backwards compatibility, but the
-    # first onboarding completion must be operationally complete.
-    if not workspace.is_onboarded:
+    # still save partial settings for backwards compatibility, but the first
+    # onboarding completion must be operationally complete.
+    #
+    # This requirement is clinic-specific: it applies when the workspace is a
+    # Clinic, and — for backwards compatibility — when no business_type was
+    # supplied at all (every payload predating dynamic onboarding). Software
+    # Agency / Real Estate / Other workspaces onboard without doctors,
+    # services or seven-day clinic hours.
+    clinic_like = payload.business_type in (None, BusinessType.CLINIC)
+    if not workspace.is_onboarded and clinic_like:
         if not payload.doctors:
             raise HTTPException(status_code=422, detail="At least one doctor is required")
         if not payload.services:

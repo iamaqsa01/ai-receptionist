@@ -1,8 +1,9 @@
+import re
 import uuid
 from datetime import time
 from enum import Enum
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
 
 class AgentTone(str, Enum):
@@ -77,6 +78,120 @@ class GeneralInfo(BaseModel):
     accepted_payment_methods: list[str] = Field(default_factory=list)
 
 
+class BusinessType(str, Enum):
+    """The kind of business this workspace runs, chosen during onboarding.
+
+    Drives which ``BusinessContext`` fields the onboarding form collects and
+    (see ``app.api.workspaces``) whether the clinic-specific onboarding
+    requirements (doctors / services / seven-day hours) apply.
+    """
+
+    SOFTWARE_AGENCY = "Software Agency"
+    CLINIC = "Clinic"
+    REAL_ESTATE = "Real Estate"
+    OTHER = "Other"
+
+
+_HTTP_URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
+
+
+def _clean_optional_url(value: str | None, label: str) -> str | None:
+    if value is None:
+        return None
+    v = value.strip()
+    if not v:
+        return None
+    if len(v) > 500:
+        raise ValueError(f"{label} must be 500 characters or fewer")
+    if not _HTTP_URL_RE.match(v):
+        raise ValueError(f"{label} must be a valid URL starting with http:// or https://")
+    return v
+
+
+class BusinessContext(BaseModel):
+    """Type-specific business information for the AI receptionist knowledge
+    base. Every field is optional; the onboarding form only sends the keys
+    relevant to the chosen ``business_type``, and this model serializes only
+    the values that were actually provided (empty defaults are dropped) so
+    the persisted JSON stays clean and deterministic.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Software Agency
+    core_services: list[str] = Field(default_factory=list)
+    minimum_pricing: str | None = Field(default=None, max_length=120)
+    discovery_call_booking_link: str | None = Field(default=None, max_length=500)
+    # Clinic  (doctor_specializations is derived from ``doctors[].specialty``
+    # by the onboarding form — never a separate manual input; clinic hours
+    # stay in ``ClinicSettingsUpdate.business_hours``.)
+    doctor_specializations: list[str] = Field(default_factory=list)
+    appointment_booking_link: str | None = Field(default=None, max_length=500)
+    # Real Estate
+    property_services: list[str] = Field(default_factory=list)
+    areas_served: list[str] = Field(default_factory=list)
+    minimum_budget: str | None = Field(default=None, max_length=120)
+    viewing_booking_link: str | None = Field(default=None, max_length=500)
+    # Other
+    custom_fields: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate(self) -> "BusinessContext":
+        self.discovery_call_booking_link = _clean_optional_url(
+            self.discovery_call_booking_link, "discovery_call_booking_link"
+        )
+        self.appointment_booking_link = _clean_optional_url(
+            self.appointment_booking_link, "appointment_booking_link"
+        )
+        self.viewing_booking_link = _clean_optional_url(self.viewing_booking_link, "viewing_booking_link")
+
+        for label, group in (
+            ("core_services", self.core_services),
+            ("doctor_specializations", self.doctor_specializations),
+            ("property_services", self.property_services),
+            ("areas_served", self.areas_served),
+        ):
+            cleaned_list = [item.strip() for item in group]
+            if any(not item for item in cleaned_list):
+                raise ValueError(f"{label} entries cannot be blank")
+            if len(cleaned_list) != len({item.casefold() for item in cleaned_list}):
+                raise ValueError(f"{label} entries must be unique")
+            setattr(self, label, cleaned_list)
+
+        cleaned_custom: dict[str, str] = {}
+        for raw_key, raw_value in self.custom_fields.items():
+            key = str(raw_key).strip()
+            if not key:
+                raise ValueError("custom_fields keys cannot be blank")
+            if len(key) > 100:
+                raise ValueError("custom_fields keys must be 100 characters or fewer")
+            if key.casefold() in {k.casefold() for k in cleaned_custom}:
+                raise ValueError(f"duplicate custom field key: {key!r}")
+            value = "" if raw_value is None else str(raw_value).strip()
+            if not value:
+                raise ValueError(f"custom field {key!r} must have a non-empty value")
+            if len(value) > 1000:
+                raise ValueError(f"custom field {key!r} value must be 1000 characters or fewer")
+            cleaned_custom[key] = value
+        self.custom_fields = cleaned_custom
+        return self
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):  # noqa: ANN001 - pydantic serializer signature
+        data = handler(self)
+        return {key: value for key, value in data.items() if value not in (None, "", [], {})}
+
+
+# Which BusinessContext keys each business type is allowed to carry. Anything
+# outside its set is rejected so the persisted context never mixes shapes.
+_BUSINESS_CONTEXT_KEYS: dict[BusinessType, set[str]] = {
+    BusinessType.SOFTWARE_AGENCY: {"core_services", "minimum_pricing", "discovery_call_booking_link"},
+    BusinessType.CLINIC: {"doctor_specializations", "appointment_booking_link"},
+    BusinessType.REAL_ESTATE: {"property_services", "areas_served", "minimum_budget", "viewing_booking_link"},
+    BusinessType.OTHER: {"custom_fields"},
+}
+
+
 class ClinicSettingsUpdate(BaseModel):
     """The complete AI knowledge base a dashboard sends for a workspace.
 
@@ -97,6 +212,27 @@ class ClinicSettingsUpdate(BaseModel):
     emergency_protocol: str | None = Field(default=None, max_length=2000)
     agent_tone: AgentTone = AgentTone.PROFESSIONAL
     preferred_language: PreferredLanguage = PreferredLanguage.ENGLISH
+    # Dynamic, context-aware onboarding (added Phase 20). ``business_type`` is
+    # optional so every pre-existing payload keeps validating unchanged;
+    # ``business_context`` only ever carries the keys for the chosen type.
+    business_type: BusinessType | None = None
+    business_context: BusinessContext = Field(default_factory=BusinessContext)
+
+    @model_validator(mode="after")
+    def validate_business_context(self) -> "ClinicSettingsUpdate":
+        present = set(self.business_context.model_dump().keys())  # already pruned to non-empty
+        if self.business_type is None:
+            if present:
+                raise ValueError("business_context can only be set together with a business_type")
+            return self
+        allowed = _BUSINESS_CONTEXT_KEYS[self.business_type]
+        unexpected = present - allowed
+        if unexpected:
+            raise ValueError(
+                f"business_context for '{self.business_type.value}' cannot include "
+                f"{sorted(unexpected)}; allowed keys: {sorted(allowed)}"
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_unique_booking_configuration(self) -> "ClinicSettingsUpdate":

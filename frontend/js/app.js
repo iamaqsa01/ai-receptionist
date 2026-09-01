@@ -1821,6 +1821,7 @@
     { id: "scheduling", label: "Scheduling" },
     { id: "emergency", label: "Emergency" },
     { id: "ai", label: "AI preferences" },
+    { id: "context", label: "Business context" },
     { id: "integrations", label: "Integrations" },
     { id: "team", label: "Team" },
   ];
@@ -1861,7 +1862,8 @@
     const panel = $("#settings-panel", container);
     ({
       business: settingsBusiness, clinic: settingsClinicInfo, scheduling: settingsScheduling,
-      emergency: settingsEmergency, ai: settingsAi, integrations: settingsIntegrations, team: settingsTeam,
+      emergency: settingsEmergency, ai: settingsAi, context: settingsBusinessContext,
+      integrations: settingsIntegrations, team: settingsTeam,
     }[active] || settingsBusiness)(panel);
   }
 
@@ -2099,6 +2101,226 @@
           ${saveBar("s-ai")}`);
         wireSave(panel, "s-ai", null,
           () => ClinicConfig.save({ agent_tone: $("#s-tone", panel).value, preferred_language: $("#s-lang", panel).value }));
+      },
+    });
+  }
+
+  // -- Business context ----------------------------------------------------
+  // Editable view of clinic_settings.business_type + .business_context (same
+  // backend contract, keys and validation as the onboarding wizard's
+  // "Business Context" step). Saved via ClinicConfig.save({business_type,
+  // business_context}) — a partial update that replaces business_context
+  // wholesale and preserves every other settings key.
+  const BC_TYPES = ["Software Agency", "Clinic", "Real Estate", "Other"];
+  const BC_URL_RE = /^https?:\/\/\S+$/i;
+
+  function bcDeriveSpecs(doctors) {
+    const out = [], seen = new Set();
+    (doctors || []).forEach((d) => {
+      const s = String((d && d.specialty) || "").trim(), k = s.toLowerCase();
+      if (s && !seen.has(k)) { seen.add(k); out.push(s); }
+    });
+    return out;
+  }
+
+  function bcStateFromSettings(cs) {
+    const t = BC_TYPES.includes(cs && cs.business_type) ? cs.business_type : "";
+    const c = (cs && cs.business_context) || {};
+    const listOr = (v) => (Array.isArray(v) && v.length ? v.slice() : [""]);
+    return {
+      type: t,
+      agency: {
+        coreServices: listOr(c.core_services),
+        minimumPricing: c.minimum_pricing || "",
+        discoveryLink: c.discovery_call_booking_link || "",
+      },
+      clinic: { appointmentLink: c.appointment_booking_link || "" },
+      realEstate: {
+        propertyServices: listOr(c.property_services),
+        areasServed: listOr(c.areas_served),
+        minimumBudget: c.minimum_budget || "",
+        viewingLink: c.viewing_booking_link || "",
+      },
+      other: {
+        customFields: (c.custom_fields && typeof c.custom_fields === "object" && Object.keys(c.custom_fields).length)
+          ? Object.keys(c.custom_fields).map((k) => ({ key: k, value: String(c.custom_fields[k] ?? "") }))
+          : [{ key: "", value: "" }],
+      },
+    };
+  }
+
+  // Live state -> { business_type, business_context } with only the selected
+  // type's non-empty keys. "Not set" clears the context entirely.
+  function bcPatchFromState(st, doctors) {
+    const t = st.type;
+    if (!BC_TYPES.includes(t)) return { business_type: null, business_context: {} };
+    const clean = (a) => a.map((x) => String(x).trim()).filter(Boolean);
+    let ctx = {};
+    if (t === "Software Agency") {
+      ctx = { core_services: clean(st.agency.coreServices), minimum_pricing: st.agency.minimumPricing.trim(), discovery_call_booking_link: st.agency.discoveryLink.trim() };
+    } else if (t === "Clinic") {
+      ctx = { doctor_specializations: bcDeriveSpecs(doctors), appointment_booking_link: st.clinic.appointmentLink.trim() };
+    } else if (t === "Real Estate") {
+      ctx = { property_services: clean(st.realEstate.propertyServices), areas_served: clean(st.realEstate.areasServed), minimum_budget: st.realEstate.minimumBudget.trim(), viewing_booking_link: st.realEstate.viewingLink.trim() };
+    } else if (t === "Other") {
+      const cf = {};
+      st.other.customFields.forEach((f) => { const k = String(f.key).trim(), v = String(f.value).trim(); if (k && v) cf[k] = v; });
+      ctx = { custom_fields: cf };
+    }
+    const business_context = {};
+    Object.entries(ctx).forEach(([k, v]) => {
+      if (v == null || v === "") return;
+      if (Array.isArray(v) && v.length === 0) return;
+      if (!Array.isArray(v) && typeof v === "object" && Object.keys(v).length === 0) return;
+      business_context[k] = v;
+    });
+    return { business_type: t, business_context };
+  }
+
+  function bcValidate(st) {
+    const t = st.type;
+    if (!t) return null; // "Not set" is allowed post-onboarding
+    const url = (v) => BC_URL_RE.test(String(v).trim());
+    const uniq = (a) => { const c = a.map((x) => String(x).trim()).filter(Boolean); return { c, ok: new Set(c.map((s) => s.toLowerCase())).size === c.length }; };
+    if (t === "Software Agency") {
+      const s = uniq(st.agency.coreServices);
+      if (!s.c.length) return "Add at least one core service.";
+      if (!s.ok) return "Core services must be unique.";
+      if (!st.agency.minimumPricing.trim()) return "Enter your minimum pricing or budget.";
+      if (!st.agency.discoveryLink.trim()) return "Enter your discovery call booking link.";
+      if (!url(st.agency.discoveryLink)) return "The discovery call booking link must start with http:// or https://";
+    } else if (t === "Clinic") {
+      if (st.clinic.appointmentLink.trim() && !url(st.clinic.appointmentLink)) return "The appointment booking link must start with http:// or https://";
+    } else if (t === "Real Estate") {
+      const ps = uniq(st.realEstate.propertyServices), ar = uniq(st.realEstate.areasServed);
+      if (!ps.c.length) return "Add at least one property service.";
+      if (!ps.ok) return "Property services must be unique.";
+      if (!ar.c.length) return "Add at least one area served.";
+      if (!ar.ok) return "Areas served must be unique.";
+      if (!st.realEstate.minimumBudget.trim()) return "Enter your minimum budget.";
+      if (!st.realEstate.viewingLink.trim()) return "Enter your viewing booking link.";
+      if (!url(st.realEstate.viewingLink)) return "The viewing booking link must start with http:// or https://";
+    } else if (t === "Other") {
+      const rows = st.other.customFields.map((f) => ({ key: String(f.key).trim(), value: String(f.value).trim() })).filter((f) => f.key || f.value);
+      if (!rows.length) return "Add at least one custom field.";
+      for (const f of rows) {
+        if (!f.key) return "Every custom field needs a key.";
+        if (!f.value) return `The “${f.key}” custom field needs a value.`;
+      }
+      const keys = rows.map((f) => f.key.toLowerCase());
+      if (new Set(keys).size !== keys.length) return "Custom field keys must be unique.";
+    }
+    return null;
+  }
+
+  function settingsBusinessContext(panel) {
+    loadInto(panel, {
+      skeleton: skeletonRows(4, 2),
+      cacheKey: "clinicConfig",
+      fetcher: () => ClinicConfig.get(),
+      render: (cs) => {
+        const doctors = cs.doctors || [];
+        const st = bcStateFromSettings(cs);
+
+        panel.innerHTML = settingsCard(
+          "Business context",
+          "The kind of business this workspace is, plus the details the AI receptionist should know. Stored with the workspace knowledge base.",
+          `<div class="field"><label class="field__label" for="s-bc-type">Business type</label>
+             <select class="select" id="s-bc-type">
+               <option value=""${!st.type ? " selected" : ""}>— Not set —</option>
+               ${BC_TYPES.map((t) => `<option value="${escapeHtml(t)}"${st.type === t ? " selected" : ""}>${escapeHtml(t)}</option>`).join("")}
+             </select></div>
+           <div id="s-bc-body" style="margin-top:16px;"></div>
+           ${saveBar("s-bc")}`
+        );
+
+        const paintList = (sel, arr, ph) => {
+          if (!arr.length) arr.push("");
+          $(sel, panel).innerHTML = arr.map((v, i) => `
+            <div class="inline-row" data-li="${i}">
+              <div class="field"><input class="input" data-f value="${escapeHtml(v)}" placeholder="${escapeHtml(ph)}" maxlength="255" aria-label="Entry ${i + 1}" /></div>
+              <button class="btn btn--ghost btn--sm" data-rm aria-label="Remove entry ${i + 1}" title="Remove">${ICONS.trash}</button>
+            </div>`).join("");
+          $$(`${sel} [data-li]`, panel).forEach((row) => {
+            const i = Number(row.dataset.li);
+            $("[data-f]", row).addEventListener("input", (e) => { arr[i] = e.target.value; });
+            $("[data-rm]", row).addEventListener("click", () => { arr.splice(i, 1); if (!arr.length) arr.push(""); paintBody(); });
+          });
+        };
+
+        const paintKv = () => {
+          const rows = st.other.customFields;
+          if (!rows.length) rows.push({ key: "", value: "" });
+          $("#s-bc-kv", panel).innerHTML = rows.map((f, i) => `
+            <div class="inline-row" data-kv="${i}">
+              <div class="field"><input class="input" data-k value="${escapeHtml(f.key)}" placeholder="Key (e.g. Industry)" maxlength="100" aria-label="Custom field key ${i + 1}" /></div>
+              <div class="field"><input class="input" data-v value="${escapeHtml(f.value)}" placeholder="Value (e.g. Legal Services)" maxlength="1000" aria-label="Custom field value ${i + 1}" /></div>
+              <button class="btn btn--ghost btn--sm" data-rm aria-label="Remove custom field ${i + 1}" title="Remove">${ICONS.trash}</button>
+            </div>`).join("");
+          $$("#s-bc-kv [data-kv]", panel).forEach((row) => {
+            const i = Number(row.dataset.kv);
+            $("[data-k]", row).addEventListener("input", (e) => { rows[i].key = e.target.value; });
+            $("[data-v]", row).addEventListener("input", (e) => { rows[i].value = e.target.value; });
+            $("[data-rm]", row).addEventListener("click", () => { rows.splice(i, 1); if (!rows.length) rows.push({ key: "", value: "" }); paintBody(); });
+          });
+        };
+
+        const paintBody = () => {
+          const body = $("#s-bc-body", panel);
+          const t = st.type;
+          if (!t) { body.innerHTML = `<div class="field__hint">Choose a business type to add its context. “Not set” clears it.</div>`; return; }
+
+          if (t === "Software Agency") {
+            body.innerHTML = `
+              <div class="field"><label class="field__label">Core services</label><div id="s-bc-list-a"></div>
+                <button class="btn btn--ghost btn--sm" id="s-bc-add-a">${ICONS.plus} Add service</button></div>
+              <div class="field" style="margin-top:14px;"><label class="field__label" for="s-bc-a-price">Minimum pricing / budget</label>
+                <input class="input" id="s-bc-a-price" maxlength="120" value="${escapeHtml(st.agency.minimumPricing)}" placeholder="e.g. $1,000 or PKR 150,000" /></div>
+              <div class="field" style="margin-top:14px;"><label class="field__label" for="s-bc-a-link">Discovery call booking link</label>
+                <input class="input" id="s-bc-a-link" type="url" maxlength="500" value="${escapeHtml(st.agency.discoveryLink)}" placeholder="https://cal.com/you/discovery" /></div>`;
+            paintList("#s-bc-list-a", st.agency.coreServices, "e.g. Web Development");
+            $("#s-bc-add-a", panel).addEventListener("click", () => { st.agency.coreServices.push(""); paintBody(); });
+            $("#s-bc-a-price", panel).addEventListener("input", (e) => { st.agency.minimumPricing = e.target.value; });
+            $("#s-bc-a-link", panel).addEventListener("input", (e) => { st.agency.discoveryLink = e.target.value; });
+          } else if (t === "Clinic") {
+            const specs = bcDeriveSpecs(doctors);
+            body.innerHTML = `
+              <div class="field"><label class="field__label">Doctor specializations</label>
+                <div class="field__hint">From the Doctors page — ${specs.length ? escapeHtml(specs.join(", ")) : "add a specialty to each doctor and it appears here."}</div></div>
+              <div class="field" style="margin-top:12px;"><label class="field__label">Clinic timings</label>
+                <div class="field__hint">Managed on the Scheduling tab (business hours) — not duplicated here.</div></div>
+              <div class="field" style="margin-top:12px;"><label class="field__label" for="s-bc-c-link">Appointment booking link</label>
+                <input class="input" id="s-bc-c-link" type="url" maxlength="500" value="${escapeHtml(st.clinic.appointmentLink)}" placeholder="https://your-clinic.com/book (optional)" /></div>`;
+            $("#s-bc-c-link", panel).addEventListener("input", (e) => { st.clinic.appointmentLink = e.target.value; });
+          } else if (t === "Real Estate") {
+            body.innerHTML = `
+              <div class="field"><label class="field__label">Property services</label><div id="s-bc-list-ps"></div>
+                <button class="btn btn--ghost btn--sm" id="s-bc-add-ps">${ICONS.plus} Add service</button></div>
+              <div class="field" style="margin-top:14px;"><label class="field__label">Areas served</label><div id="s-bc-list-ar"></div>
+                <button class="btn btn--ghost btn--sm" id="s-bc-add-ar">${ICONS.plus} Add area</button></div>
+              <div class="field" style="margin-top:14px;"><label class="field__label" for="s-bc-re-budget">Minimum budget</label>
+                <input class="input" id="s-bc-re-budget" maxlength="120" value="${escapeHtml(st.realEstate.minimumBudget)}" placeholder="e.g. PKR 10,000,000" /></div>
+              <div class="field" style="margin-top:14px;"><label class="field__label" for="s-bc-re-link">Viewing booking link</label>
+                <input class="input" id="s-bc-re-link" type="url" maxlength="500" value="${escapeHtml(st.realEstate.viewingLink)}" placeholder="https://calendly.com/you/viewing" /></div>`;
+            paintList("#s-bc-list-ps", st.realEstate.propertyServices, "e.g. Residential Sales");
+            paintList("#s-bc-list-ar", st.realEstate.areasServed, "e.g. DHA Phase 5");
+            $("#s-bc-add-ps", panel).addEventListener("click", () => { st.realEstate.propertyServices.push(""); paintBody(); });
+            $("#s-bc-add-ar", panel).addEventListener("click", () => { st.realEstate.areasServed.push(""); paintBody(); });
+            $("#s-bc-re-budget", panel).addEventListener("input", (e) => { st.realEstate.minimumBudget = e.target.value; });
+            $("#s-bc-re-link", panel).addEventListener("input", (e) => { st.realEstate.viewingLink = e.target.value; });
+          } else if (t === "Other") {
+            body.innerHTML = `
+              <div class="settings-card__desc" style="margin-bottom:8px;">Key/value details for the AI receptionist. Keys must be unique and non-blank.</div>
+              <div id="s-bc-kv"></div>
+              <button class="btn btn--secondary btn--sm" id="s-bc-add-kv">${ICONS.plus} Add field</button>`;
+            paintKv();
+            $("#s-bc-add-kv", panel).addEventListener("click", () => { st.other.customFields.push({ key: "", value: "" }); paintBody(); });
+          }
+        };
+
+        $("#s-bc-type", panel).addEventListener("change", (e) => { st.type = e.target.value; paintBody(); });
+        paintBody();
+        wireSave(panel, "s-bc", () => bcValidate(st), () => ClinicConfig.save(bcPatchFromState(st, doctors)));
       },
     });
   }
