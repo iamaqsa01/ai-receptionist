@@ -245,10 +245,45 @@ def test_envelope_payload_still_works(client, clinic):
     assert response.json()["results"][0]["result"]["success"] is True
 
 
-def test_empty_body_is_still_rejected(client, clinic):
+def test_empty_body_returns_a_tool_result_naming_what_is_missing(client, clinic):
+    """The assistant sends every argument empty when it has collected none.
+
+    Taken from a live call: book_appointment arrived with patient_name,
+    patient_phone and availability_token all empty strings. That used to
+    be an HTTP 422, so Vapi got no tool result and the assistant could
+    only apologise. It now learns exactly which fields it still needs.
+    """
     workspace = clinic[0]
     response = post(client, workspace, "check-availability", {})
-    assert response.status_code == 422
+    assert response.status_code == 200, response.text
+    result = response.json()["results"][0]["result"]
+    assert result["success"] is False
+    assert result["code"] == "INVALID_ARGUMENTS"
+    assert "preferred_date" in result["missing_arguments"]
+
+
+def test_all_empty_booking_arguments_name_the_missing_fields(client, clinic):
+    workspace = clinic[0]
+    response = post(
+        client,
+        workspace,
+        "book-appointment",
+        {
+            "patient_name": "",
+            "patient_email": "",
+            "patient_phone": "",
+            "availability_token": "",
+        },
+    )
+    assert response.status_code == 200, response.text
+    result = response.json()["results"][0]["result"]
+    assert result["success"] is False
+    assert result["code"] == "INVALID_ARGUMENTS"
+    assert set(result["missing_arguments"]) == {
+        "availability_token",
+        "patient_name",
+        "patient_phone",
+    }
 
 
 def test_unknown_service_returns_the_real_service_list(client, clinic):

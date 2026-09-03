@@ -29,6 +29,7 @@ from app.models.service import Service
 from app.models.workspace import Workspace
 from app.services.phone_numbers import normalize_e164
 from app.schemas.vapi import (
+    FLAT_TOOL_CALL_NAME,
     BookAppointmentArguments,
     CheckAvailabilityArguments,
     VapiToolCall,
@@ -62,12 +63,26 @@ def _result(tool_call: VapiToolCall, result: dict) -> VapiToolResult:
 
 
 def _argument_error(tool_call: VapiToolCall, exc: ValidationError) -> VapiToolResult:
+    """Name the offending fields.
+
+    Joining the raw messages produced "Field required; Field required",
+    which tells the assistant nothing it can act on. Naming each field
+    lets it ask the caller for what is actually missing.
+    """
+    details = []
+    missing = []
+    for error in exc.errors():
+        field = ".".join(str(part) for part in error["loc"]) or "body"
+        details.append(f"{field}: {error['msg']}")
+        if error["type"] == "missing":
+            missing.append(field)
     return _result(
         tool_call,
         {
             "success": False,
             "code": "INVALID_ARGUMENTS",
-            "message": "; ".join(error["msg"] for error in exc.errors()),
+            "message": "; ".join(details),
+            "missing_arguments": missing,
         },
     )
 
@@ -221,7 +236,7 @@ def check_availability(
     results: list[VapiToolResult] = []
 
     for tool_call in payload.message.tool_call_list:
-        if tool_call.name != "check_availability":
+        if tool_call.name not in ("check_availability", FLAT_TOOL_CALL_NAME):
             results.append(_result(tool_call, {"success": False, "code": "INVALID_TOOL", "message": "Expected check_availability"}))
             continue
         try:
@@ -343,7 +358,7 @@ def book_appointment(
     results: list[VapiToolResult] = []
 
     for tool_call in payload.message.tool_call_list:
-        if tool_call.name != "book_appointment":
+        if tool_call.name not in ("book_appointment", FLAT_TOOL_CALL_NAME):
             results.append(_result(tool_call, {"success": False, "code": "INVALID_TOOL", "message": "Expected book_appointment"}))
             continue
         try:
