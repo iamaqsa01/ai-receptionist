@@ -18,6 +18,11 @@ def normalize_notification_language(code: str | None) -> str:
     return "ur" if (code or "").strip().lower() == "ur" else "en"
 
 
+def format_when(start: datetime) -> str:
+    """Public: a template parameter needs the same wording as the body."""
+    return _format_when(start)
+
+
 def _format_when(start: datetime) -> str:
     # "%-I"/"%-d" aren't portable on Windows; strip a leading zero instead.
     return start.strftime("%A, %B %d at %I:%M %p").replace(" 0", " ")

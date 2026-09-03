@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.integrations.notifications import templates
 from app.integrations.notifications.base import EmailProvider, WhatsAppProvider
 from app.integrations.notifications.clinic_config import load_clinic_contact
@@ -24,6 +25,22 @@ _BODY_BUILDERS = {
     "appointment_cancellation": templates.appointment_cancellation_body,
     "appointment_reschedule": templates.appointment_reschedule_body,
 }
+
+# Only patient-facing messages need an approved template. Clinic and
+# doctor copies go to staff who have messaged the business, so free-form
+# text still reaches them.
+_TEMPLATE_SETTINGS = {
+    "appointment_confirmation": "meta_whatsapp_template_confirmation",
+    "appointment_cancellation": "meta_whatsapp_template_cancellation",
+    "appointment_reschedule": "meta_whatsapp_template_reschedule",
+}
+
+
+def _patient_template_name(event_type: str) -> str:
+    setting = _TEMPLATE_SETTINGS.get(event_type)
+    if setting is None:
+        return ""
+    return (getattr(settings, setting, "") or "").strip()
 
 
 class NotificationService:
@@ -69,6 +86,8 @@ class NotificationService:
         audience: str,
         to: str,
         body: str,
+        template_name: str = "",
+        template_parameters: list[str] | None = None,
     ) -> NotificationMessage:
         existing = self._find_sent(workspace_id, appointment_id, event_type, "whatsapp", to)
         if existing is not None:
@@ -85,8 +104,20 @@ class NotificationService:
             status="pending",
             body=body,
         )
+        use_template = bool(
+            template_name and template_parameters and self.whatsapp.supports_templates()
+        )
         try:
-            result = self.whatsapp.send(to, body)
+            if use_template:
+                result = self.whatsapp.send_template(
+                    to,
+                    template_name=template_name,
+                    language=settings.meta_whatsapp_template_language or "en",
+                    parameters=list(template_parameters or []),
+                    fallback_body=body,
+                )
+            else:
+                result = self.whatsapp.send(to, body)
         except NotificationError as exc:
             logger.error("WhatsApp send failed (event=%s, to=%s): %s", event_type, to, exc, exc_info=True)
             record.status = "failed"
@@ -186,6 +217,12 @@ class NotificationService:
                     audience="patient",
                     to=patient.phone,
                     body=patient_body,
+                    template_name=_patient_template_name(event_type),
+                    template_parameters=[
+                        patient_name,
+                        service_summary,
+                        templates.format_when(appointment.start_time),
+                    ],
                 )
             )
         if patient.email:
