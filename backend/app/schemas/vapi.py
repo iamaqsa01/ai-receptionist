@@ -2,7 +2,32 @@ from datetime import date, time
 from typing import Any
 import uuid
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
+
+
+# A voice assistant cannot omit an optional tool argument it never
+# collected, so it sends a placeholder instead. Left as-is these fail
+# schema validation, and for patient_email that rejects the entire HTTP
+# request with a 422 before the booking handler runs -- Vapi receives no
+# tool result at all and the caller is left hanging. Treat them as absent.
+_BLANK_VALUES = {
+    "",
+    "-",
+    "n/a",
+    "na",
+    "none",
+    "null",
+    "nil",
+    "undefined",
+    "unknown",
+    "not provided",
+}
+
+
+def _blank_to_none(value: Any) -> Any:
+    if isinstance(value, str) and value.strip().lower() in _BLANK_VALUES:
+        return None
+    return value
 
 
 class VapiPhoneNumber(BaseModel):
@@ -85,6 +110,11 @@ class CheckAvailabilityArguments(BaseModel):
     preferred_time: time | None = None
     max_slots: int = Field(default=5, ge=1, le=10)
 
+    @field_validator("service_name", "provider_name", mode="before")
+    @classmethod
+    def blank_optional_is_none(cls, value: Any) -> Any:
+        return _blank_to_none(value)
+
     @model_validator(mode="after")
     def require_service_identity(self) -> "CheckAvailabilityArguments":
         if self.service_id is None and self.service_name is None:
@@ -98,6 +128,11 @@ class BookAppointmentArguments(BaseModel):
     patient_phone: str = Field(min_length=5, max_length=32)
     patient_email: EmailStr | None = None
     reason: str | None = Field(default=None, max_length=1000)
+
+    @field_validator("patient_email", "reason", mode="before")
+    @classmethod
+    def blank_optional_is_none(cls, value: Any) -> Any:
+        return _blank_to_none(value)
 
 
 class VapiToolResult(BaseModel):

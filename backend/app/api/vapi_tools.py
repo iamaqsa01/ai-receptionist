@@ -4,6 +4,13 @@ from datetime import timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from phonenumbers import (
+    PhoneNumberFormat,
+    format_number,
+    is_valid_number,
+    parse,
+    region_code_for_number,
+)
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -104,6 +111,80 @@ def _workspace_from_vapi_request(db: Session, payload: VapiToolRequest) -> Works
     raise HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
         detail="No workspace is assigned to this phone number.",
+    )
+
+
+def _caller_region(payload: VapiToolRequest) -> str | None:
+    """Country of the numbers already on the call.
+
+    Used as the default region when reading back a patient number the
+    caller spelled out without a country code.
+    """
+    for number in payload.routing_phone_numbers:
+        try:
+            parsed = parse(number, None)
+        except Exception:
+            continue
+        region = region_code_for_number(parsed)
+        if region:
+            return region
+    return None
+
+
+def _normalize_patient_phone(number: str, region: str | None) -> str | None:
+    """Return a patient phone in E.164, or None when it cannot be read.
+
+    Deliberately more forgiving than ``normalize_e164``, which routing
+    uses: a clinic line is configured once by staff and can be required
+    to carry its country code, but a patient says their number out loud
+    in local form ("0300 1234567") far more often than in E.164.
+    Parsing against no region rejected almost every real booking. An
+    explicit country code is still tried first so it always wins.
+    """
+    cleaned = (number or "").strip()
+    if not cleaned:
+        return None
+    for candidate_region in (None, region):
+        if candidate_region is None and not cleaned.startswith("+"):
+            continue
+        try:
+            parsed = parse(cleaned, candidate_region)
+        except Exception:
+            continue
+        if is_valid_number(parsed):
+            return format_number(parsed, PhoneNumberFormat.E164)
+    return None
+
+
+def _log_booking_response(
+    workspace_id: uuid.UUID,
+    call_id: str | None,
+    response: VapiToolResponse,
+) -> None:
+    """Record what booking actually returned to Vapi.
+
+    Without this a failed booking is invisible from the outside: the
+    caller is told something went wrong and the access log shows a 200.
+    """
+    logger.info(
+        "vapi book-appointment complete: %d result(s), %d booked",
+        len(response.results),
+        sum(item.result.get("success") is True for item in response.results),
+        extra={
+            "event": "vapi_book_appointment_response",
+            "vapi_workspace_id": str(workspace_id),
+            "vapi_call_id": call_id,
+            "results": [
+                {
+                    "tool_call_id": item.tool_call_id,
+                    "success": item.result.get("success"),
+                    "code": item.result.get("code"),
+                    "message": item.result.get("message"),
+                    "appointment_id": item.result.get("appointment_id"),
+                }
+                for item in response.results
+            ],
+        },
     )
 
 
@@ -217,14 +298,36 @@ def book_appointment(
             results.append(_argument_error(tool_call, exc))
             continue
 
+        # The call id is only an idempotency key. A payload that omits the
+        # call object is still a valid booking request, so fall back to
+        # the tool call id (unique per Vapi invocation, and replayed
+        # unchanged on a Vapi retry) rather than refusing outright.
+        idempotency_call_id = payload.call_id or f"vapi-tool:{tool_call.id}"
         if not payload.call_id:
-            results.append(_result(tool_call, {"success": False, "code": "MISSING_CALL_ID", "message": "The Vapi call ID is required."}))
-            continue
+            logger.warning(
+                "vapi book-appointment: no call id on the request, keying idempotency on tool call %s",
+                tool_call.id,
+                extra={
+                    "event": "vapi_book_appointment_missing_call_id",
+                    "vapi_workspace_id": str(workspace_id),
+                    "vapi_tool_call_id": tool_call.id,
+                },
+            )
         if not validate_name(args.patient_name):
             results.append(_result(tool_call, {"success": False, "code": "INVALID_PATIENT_NAME", "message": "A valid patient name is required."}))
             continue
-        if not validate_phone(args.patient_phone):
-            results.append(_result(tool_call, {"success": False, "code": "INVALID_PATIENT_PHONE", "message": "The patient phone number must be valid E.164 format."}))
+        patient_phone = _normalize_patient_phone(args.patient_phone, _caller_region(payload))
+        if patient_phone is None or not validate_phone(patient_phone):
+            results.append(
+                _result(
+                    tool_call,
+                    {
+                        "success": False,
+                        "code": "INVALID_PATIENT_PHONE",
+                        "message": "That phone number could not be read. Ask the caller to repeat it, including the country code.",
+                    },
+                )
+            )
             continue
 
         try:
@@ -249,22 +352,50 @@ def book_appointment(
         note = f"Booked via Vapi ({service.name})"
         if args.reason:
             note += f" - {args.reason}"
-        booking = scheduling.book_appointment(
-            AppointmentBookingRequest(
-                workspace=workspace,
-                service=service,
-                provider=provider,
-                start_time=token.start_time,
-                patient_name=args.patient_name,
-                patient_phone=args.patient_phone,
-                patient_email=str(args.patient_email) if args.patient_email else None,
-                notes=note,
-                source="Vapi",
-                vapi_call_id=payload.call_id,
-                vapi_tool_call_id=tool_call.id,
-                enforce_business_hours=True,
+        # An exception escaping here becomes a bare HTTP 500, which reaches
+        # Vapi as no tool result at all: the assistant has nothing to say
+        # and the caller hears silence or a false confirmation. A live call
+        # always gets a result back, even when the booking fails.
+        try:
+            booking = scheduling.book_appointment(
+                AppointmentBookingRequest(
+                    workspace=workspace,
+                    service=service,
+                    provider=provider,
+                    start_time=token.start_time,
+                    patient_name=args.patient_name,
+                    patient_phone=patient_phone,
+                    patient_email=str(args.patient_email) if args.patient_email else None,
+                    notes=note,
+                    source="Vapi",
+                    vapi_call_id=idempotency_call_id,
+                    vapi_tool_call_id=tool_call.id,
+                    enforce_business_hours=True,
+                )
             )
-        )
+        except Exception:
+            db.rollback()
+            logger.exception(
+                "vapi book-appointment failed for workspace %s",
+                workspace_id,
+                extra={
+                    "event": "vapi_book_appointment_failed",
+                    "vapi_workspace_id": str(workspace_id),
+                    "vapi_call_id": payload.call_id,
+                    "vapi_tool_call_id": tool_call.id,
+                },
+            )
+            results.append(
+                _result(
+                    tool_call,
+                    {
+                        "success": False,
+                        "code": "BOOKING_FAILED",
+                        "message": "The appointment could not be saved. Offer to take a message or transfer the caller.",
+                    },
+                )
+            )
+            continue
 
         if booking.outcome == BookingOutcome.DUPLICATE:
             results.append(_result(tool_call, {"success": False, "code": "DUPLICATE_BOOKING", "message": "This patient already has an overlapping appointment."}))
@@ -300,7 +431,9 @@ def book_appointment(
             )
         )
 
-    return VapiToolResponse(results=results)
+    response = VapiToolResponse(results=results)
+    _log_booking_response(workspace_id, payload.call_id, response)
+    return response
 
 
 @dynamic_router.post("/check-availability", response_model=VapiToolResponse)

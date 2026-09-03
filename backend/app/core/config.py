@@ -96,7 +96,10 @@ class Settings(BaseSettings):
     # Inbound custom-tool authentication. This is intentionally distinct
     # from VAPI_API_KEY, which authorizes outbound calls to Vapi's API.
     vapi_tool_webhook_secret: str = ""
-    vapi_availability_token_expire_seconds: int = 300
+    # The caller hears the slots, then gives a name, a phone number and a
+    # reason. Five minutes routinely expired mid-conversation, so the
+    # booking failed on a token that had been valid when it was issued.
+    vapi_availability_token_expire_seconds: int = 1800
 
     stt_provider: str = "mock"  # "mock" | "deepgram"
     deepgram_api_key: str = ""
