@@ -143,6 +143,15 @@ class Settings(BaseSettings):
     whatsapp_from_number: str = ""  # Twilio WhatsApp-enabled sender, e.g. "+14155238886"
     meta_whatsapp_access_token: str = ""
     meta_whatsapp_phone_number_id: str = ""
+    # Pre-approved WhatsApp template names, one per patient-facing event.
+    # Blank means send free-form text, which only reaches a patient who
+    # messaged the clinic on WhatsApp within the last 24 hours -- almost
+    # never true of someone who telephoned. Each template must take three
+    # body parameters in this order: patient name, service, when.
+    meta_whatsapp_template_confirmation: str = ""
+    meta_whatsapp_template_cancellation: str = ""
+    meta_whatsapp_template_reschedule: str = ""
+    meta_whatsapp_template_language: str = "en"
 
     email_provider: str = "mock"  # "mock" | "sendgrid"
     sendgrid_api_key: str = ""

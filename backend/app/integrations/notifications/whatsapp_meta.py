@@ -34,17 +34,60 @@ class MetaWhatsAppProvider(WhatsAppProvider):
     def is_available(self) -> bool:
         return bool(self._access_token and self._phone_number_id)
 
+    def supports_templates(self) -> bool:
+        return True
+
     def send(self, to: str, body: str) -> MessageSendResult:
+        return self._post(
+            {
+                "messaging_product": "whatsapp",
+                "to": to,
+                "type": "text",
+                "text": {"body": body},
+            }
+        )
+
+    def send_template(
+        self,
+        to: str,
+        *,
+        template_name: str,
+        language: str,
+        parameters: list[str],
+        fallback_body: str,
+    ) -> MessageSendResult:
+        """Send a pre-approved template.
+
+        The only way to reach a patient who telephoned rather than
+        messaged: they never opened a 24-hour window, so free-form text
+        would be refused. Body parameters are positional and must match
+        the {{1}}, {{2}}, {{3}} placeholders in the approved template.
+        """
+        return self._post(
+            {
+                "messaging_product": "whatsapp",
+                "to": to,
+                "type": "template",
+                "template": {
+                    "name": template_name,
+                    "language": {"code": language},
+                    "components": [
+                        {
+                            "type": "body",
+                            "parameters": [
+                                {"type": "text", "text": value} for value in parameters
+                            ],
+                        }
+                    ],
+                },
+            }
+        )
+
+    def _post(self, payload: dict) -> MessageSendResult:
         if not self.is_available():
             raise NotificationAuthError("Meta WhatsApp provider is not configured")
 
         url = f"https://graph.facebook.com/{self._api_version}/{self._phone_number_id}/messages"
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": to,
-            "type": "text",
-            "text": {"body": body},
-        }
         headers = {"Authorization": f"Bearer {self._access_token}"}
         try:
             response = httpx.post(url, json=payload, headers=headers, timeout=self._timeout_seconds)

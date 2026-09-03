@@ -21,6 +21,34 @@ class WhatsAppProvider(ABC):
     @abstractmethod
     def send(self, to: str, body: str) -> MessageSendResult: ...
 
+    def supports_templates(self) -> bool:
+        """Whether this backend can send a pre-approved template.
+
+        WhatsApp only permits free-form text inside the 24-hour window
+        that opens when the customer messages the business. A patient
+        who telephoned the clinic never did that, so a booking
+        confirmation has to go out as an approved template or not at
+        all. Backends that cannot do templates keep sending free-form.
+        """
+        return False
+
+    def send_template(
+        self,
+        to: str,
+        *,
+        template_name: str,
+        language: str,
+        parameters: list[str],
+        fallback_body: str,
+    ) -> MessageSendResult:
+        """Send a template, or fall back to free-form text.
+
+        The fallback keeps the mock and Twilio backends working
+        unchanged, and keeps local development free of any template
+        approval step.
+        """
+        return self.send(to, fallback_body)
+
 
 class EmailProvider(ABC):
     """Every email backend (SendGrid, mock) implements this same
