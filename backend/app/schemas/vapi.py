@@ -1,3 +1,5 @@
+import hashlib
+import json
 from datetime import date, time
 from typing import Any
 import uuid
@@ -28,6 +30,19 @@ def _blank_to_none(value: Any) -> Any:
     if isinstance(value, str) and value.strip().lower() in _BLANK_VALUES:
         return None
     return value
+
+
+def _direct_tool_call_id(tool_name: str, arguments: dict[str, Any]) -> str:
+    """Stable per-invocation id for a flat-body tool call.
+
+    A flat body carries no tool call id of its own. A constant would make
+    every booking in one call look like an idempotent replay of the
+    first, so the id is derived from the arguments: a Vapi retry sends
+    the same body and stays idempotent, while a second, different
+    booking in the same call gets its own id.
+    """
+    digest = hashlib.sha256(json.dumps(arguments, sort_keys=True, default=str).encode()).hexdigest()
+    return f"direct-{tool_name}-{digest[:32]}"
 
 
 class VapiPhoneNumber(BaseModel):
@@ -66,13 +81,69 @@ class VapiToolMessage(BaseModel):
 
 
 class VapiToolRequest(BaseModel):
-    message: VapiToolMessage
+    message: VapiToolMessage | None = None
     call: VapiCall | None = None
+
+    # A Vapi custom tool can be configured to POST its arguments as a flat
+    # body rather than the toolCallList envelope, and assistants in the
+    # field do exactly that. Rejecting it produced an HTTP 422 with no
+    # tool result, so the assistant apologised mid-call and the caller
+    # never got an appointment. Both request shapes are accepted.
+    service_id: uuid.UUID | None = None
+    service_name: str | None = None
+    provider_id: uuid.UUID | None = None
+    provider_name: str | None = None
+    preferred_date: date | None = None
+    preferred_time: time | None = None
+    max_slots: int | None = None
+    availability_token: str | None = None
+    patient_name: str | None = None
+    patient_phone: str | None = None
+    patient_email: EmailStr | None = None
+    reason: str | None = None
 
     model_config = ConfigDict(extra="ignore")
 
+    @field_validator(
+        "service_id",
+        "service_name",
+        "provider_id",
+        "provider_name",
+        "preferred_date",
+        "preferred_time",
+        "max_slots",
+        "availability_token",
+        "patient_name",
+        "patient_phone",
+        "patient_email",
+        "reason",
+        mode="before",
+    )
+    @classmethod
+    def blank_optional_is_none(cls, value: Any) -> Any:
+        return _blank_to_none(value)
+
     @model_validator(mode="after")
     def require_tool_calls_message(self) -> "VapiToolRequest":
+        if self.message is None:
+            arguments = self.model_dump(
+                mode="json", exclude_none=True, exclude={"message", "call"}
+            )
+            if not arguments:
+                raise ValueError("message is required when no tool arguments are supplied")
+            tool_name = (
+                "book_appointment" if "availability_token" in arguments else "check_availability"
+            )
+            self.message = VapiToolMessage(
+                type="tool-calls",
+                toolCallList=[
+                    VapiToolCall(
+                        id=_direct_tool_call_id(tool_name, arguments),
+                        name=tool_name,
+                        arguments=arguments,
+                    )
+                ],
+            )
         if self.message.type != "tool-calls":
             raise ValueError("message.type must be 'tool-calls'")
         return self
@@ -109,6 +180,11 @@ class CheckAvailabilityArguments(BaseModel):
     preferred_date: date
     preferred_time: time | None = None
     max_slots: int = Field(default=5, ge=1, le=10)
+
+    @field_validator("max_slots", mode="before")
+    @classmethod
+    def blank_max_slots_is_default(cls, value: Any) -> Any:
+        return 5 if _blank_to_none(value) is None else value
 
     @field_validator("service_name", "provider_name", mode="before")
     @classmethod
