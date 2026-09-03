@@ -32,6 +32,13 @@ def _blank_to_none(value: Any) -> Any:
     return value
 
 
+# Name given to the tool call synthesised from a flat body. The endpoint
+# URL already says which tool was invoked, so the name is not inferred
+# from the arguments -- inference broke when the assistant sent every
+# argument empty, which is exactly when a clear error matters most.
+FLAT_TOOL_CALL_NAME = "vapi_flat_body"
+
+
 def _direct_tool_call_id(tool_name: str, arguments: dict[str, Any]) -> str:
     """Stable per-invocation id for a flat-body tool call.
 
@@ -158,17 +165,17 @@ class VapiToolRequest(BaseModel):
                 exclude_none=True,
                 exclude={"message", "call"} | self._ROUTING_FIELDS,
             )
-            if not arguments:
-                raise ValueError("message is required when no tool arguments are supplied")
-            tool_name = (
-                "book_appointment" if "availability_token" in arguments else "check_availability"
-            )
+            # An assistant that has collected nothing sends every argument
+            # empty. Refusing the request outright returned a 422, which
+            # reaches Vapi as no tool result, so the assistant only knew
+            # "something broke". Let it through: argument validation then
+            # names the missing fields and the call can recover.
             self.message = VapiToolMessage(
                 type="tool-calls",
                 toolCallList=[
                     VapiToolCall(
-                        id=_direct_tool_call_id(tool_name, arguments),
-                        name=tool_name,
+                        id=_direct_tool_call_id(FLAT_TOOL_CALL_NAME, arguments),
+                        name=FLAT_TOOL_CALL_NAME,
                         arguments=arguments,
                     )
                 ],
