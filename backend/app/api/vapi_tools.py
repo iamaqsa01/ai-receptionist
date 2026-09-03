@@ -16,6 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.ai.qualification.validators import validate_name, validate_phone
+from app.core.config import settings
 from app.ai.scheduling.outcomes import BookingOutcome
 from app.database.session import get_db
 from app.integrations.vapi.security import (
@@ -204,13 +205,18 @@ def _normalize_patient_phone(number: str, region: str | None) -> str | None:
     uses: a clinic line is configured once by staff and can be required
     to carry its country code, but a patient says their number out loud
     in local form ("0300 1234567") far more often than in E.164.
-    Parsing against no region rejected almost every real booking. An
-    explicit country code is still tried first so it always wins.
+
+    Tried in order: an explicit country code, then the country the
+    caller is ringing from, then DEFAULT_PHONE_REGION. The last one
+    matters for a clinic whose callers are all domestic but whose line
+    is foreign -- a US Vapi number answering Pakistani patients -- and
+    it means nobody has to be asked to recite a country code.
     """
     cleaned = (number or "").strip()
     if not cleaned:
         return None
-    for candidate_region in (None, region):
+    default_region = (settings.default_phone_region or "").strip().upper() or None
+    for candidate_region in (None, region, default_region):
         if candidate_region is None and not cleaned.startswith("+"):
             continue
         try:

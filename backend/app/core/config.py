@@ -100,6 +100,12 @@ class Settings(BaseSettings):
     # reason. Five minutes routinely expired mid-conversation, so the
     # booking failed on a token that had been valid when it was issued.
     vapi_availability_token_expire_seconds: int = 1800
+    # Country a patient's phone number is read against when they give it
+    # without a country code, which on a domestic line is almost always.
+    # Two-letter ISO code; blank requires every number to carry its own
+    # country code. Only ever a fallback: an explicit +code always wins,
+    # and the caller's own number is tried before this.
+    default_phone_region: str = "PK"
 
     stt_provider: str = "mock"  # "mock" | "deepgram"
     deepgram_api_key: str = ""

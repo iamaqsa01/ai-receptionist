@@ -214,3 +214,55 @@ def test_the_token_path_still_works(client, clinic, db_session):
         },
     ).json()["results"][0]["result"]
     assert result["success"] is True, result
+
+
+def test_local_number_works_with_no_country_context_at_all(client, clinic, db_session):
+    """A domestic caller should never be asked to recite a country code.
+
+    The clinic line here is a US Vapi number and the request carries no
+    caller number, so the only thing left to read "0300 1234567" against is
+    DEFAULT_PHONE_REGION.
+    """
+    workspace, day = clinic
+    response = client.post(
+        "/api/v1/integrations/vapi/tools/book-appointment",
+        json={
+            "service_name": "dental cleaning",
+            "preferred_date": day.isoformat(),
+            "preferred_time": "15:00",
+            "patient_name": "Ayesha Malik",
+            "patient_phone": "0300 1234567",
+            "called_number": CLINIC_LINE,
+        },
+        headers={"Authorization": f"Bearer {VAPI_SECRET}"},
+    )
+    assert response.status_code == 200, response.text
+    result = response.json()["results"][0]["result"]
+    assert result["success"] is True, result
+
+    patient = db_session.execute(
+        select(Patient).where(Patient.workspace_id == workspace.id)
+    ).scalar_one()
+    assert patient.phone == "+923001234567"
+
+
+def test_an_explicit_country_code_still_overrides_the_default(client, clinic, db_session):
+    workspace, day = clinic
+    result = client.post(
+        "/api/v1/integrations/vapi/tools/book-appointment",
+        json={
+            "service_name": "dental cleaning",
+            "preferred_date": day.isoformat(),
+            "preferred_time": "15:30",
+            "patient_name": "Bilal Sheikh",
+            "patient_phone": "+1 415 555 0100",
+            "called_number": CLINIC_LINE,
+        },
+        headers={"Authorization": f"Bearer {VAPI_SECRET}"},
+    ).json()["results"][0]["result"]
+    assert result["success"] is True, result
+
+    patient = db_session.execute(
+        select(Patient).where(Patient.workspace_id == workspace.id, Patient.phone == "+14155550100")
+    ).scalar_one()
+    assert patient.phone == "+14155550100"
