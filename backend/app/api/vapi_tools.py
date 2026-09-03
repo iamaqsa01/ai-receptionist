@@ -1,6 +1,6 @@
 import logging
 import uuid
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -151,13 +151,42 @@ def _active_provider_names(db: Session, workspace_id: uuid.UUID) -> list[str]:
     )
 
 
-def _caller_region(payload: VapiToolRequest) -> str | None:
-    """Country of the numbers already on the call.
+def _first_free_provider(
+    db: Session,
+    scheduling: AppointmentSchedulingService,
+    workspace: Workspace,
+    service,
+    start_time: datetime,
+):
+    """Pick a doctor who is actually free, when the caller named none.
 
-    Used as the default region when reading back a patient number the
-    caller spelled out without a country code.
+    Mirrors how availability offers slots: any active provider will do,
+    so long as the slot is genuinely open for them.
     """
-    for number in payload.routing_phone_numbers:
+    providers = db.execute(
+        select(Provider)
+        .where(Provider.workspace_id == workspace.id, Provider.is_active.is_(True))
+        .order_by(Provider.name)
+    ).scalars()
+    for provider in providers:
+        if scheduling.is_slot_available(
+            workspace, service, provider, start_time, enforce_business_hours=True
+        ):
+            return provider
+    return None
+
+
+def _caller_region(payload: VapiToolRequest) -> str | None:
+    """Country to read a patient number against when it has no country code.
+
+    The caller's own number decides this, not the number they dialled.
+    ``routing_phone_numbers`` puts the dialled number first because that
+    is what identifies the clinic, but a Pakistani patient ringing a US
+    clinic line would then have "0324 5929020" read as American and
+    rejected. Reversed, the caller comes first and the clinic line is
+    only a fallback.
+    """
+    for number in reversed(payload.routing_phone_numbers):
         try:
             parsed = parse(number, None)
         except Exception:
@@ -399,24 +428,77 @@ def book_appointment(
             )
             continue
 
-        try:
-            token = decode_availability_token(args.availability_token)
-        except ValueError as exc:
-            results.append(_result(tool_call, {"success": False, "code": "INVALID_AVAILABILITY_TOKEN", "message": str(exc)}))
-            continue
-        if token.workspace_id != workspace.id:
-            results.append(_result(tool_call, {"success": False, "code": "INVALID_AVAILABILITY_TOKEN", "message": "The token belongs to another clinic."}))
-            continue
+        if args.availability_token:
+            try:
+                token = decode_availability_token(args.availability_token)
+            except ValueError as exc:
+                results.append(_result(tool_call, {"success": False, "code": "INVALID_AVAILABILITY_TOKEN", "message": str(exc)}))
+                continue
+            if token.workspace_id != workspace.id:
+                results.append(_result(tool_call, {"success": False, "code": "INVALID_AVAILABILITY_TOKEN", "message": "The token belongs to another clinic."}))
+                continue
 
-        service = scheduling.resolve_service(workspace.id, service_id=token.service_id)
-        provider = scheduling.resolve_provider(workspace.id, provider_id=token.provider_id)
-        if service is None or provider is None:
-            results.append(_result(tool_call, {"success": False, "code": "CONFIGURATION_CHANGED", "message": "The service or provider is no longer available."}))
-            continue
-        expected_end = token.start_time.astimezone(timezone.utc) + timedelta(minutes=service.duration_minutes)
-        if token.end_time.astimezone(timezone.utc) != expected_end:
-            results.append(_result(tool_call, {"success": False, "code": "INVALID_AVAILABILITY_TOKEN", "message": "The token duration is invalid."}))
-            continue
+            service = scheduling.resolve_service(workspace.id, service_id=token.service_id)
+            provider = scheduling.resolve_provider(workspace.id, provider_id=token.provider_id)
+            if service is None or provider is None:
+                results.append(_result(tool_call, {"success": False, "code": "CONFIGURATION_CHANGED", "message": "The service or provider is no longer available."}))
+                continue
+            expected_end = token.start_time.astimezone(timezone.utc) + timedelta(minutes=service.duration_minutes)
+            if token.end_time.astimezone(timezone.utc) != expected_end:
+                results.append(_result(tool_call, {"success": False, "code": "INVALID_AVAILABILITY_TOKEN", "message": "The token duration is invalid."}))
+                continue
+            start_time = token.start_time
+        else:
+            # No token: the caller named a time and the assistant passed it
+            # straight through. Everything is re-resolved and re-checked
+            # here, so this path grants nothing the token path did not.
+            service = scheduling.resolve_service(
+                workspace.id, service_id=args.service_id, service_name=args.service_name
+            )
+            if service is None:
+                results.append(
+                    _result(
+                        tool_call,
+                        {
+                            "success": False,
+                            "code": "SERVICE_NOT_FOUND",
+                            "message": (
+                                "That service was not found. Read the available services to "
+                                "the caller and book using the name exactly as listed."
+                            ),
+                            "available_services": _active_service_names(db, workspace.id),
+                        },
+                    )
+                )
+                continue
+            try:
+                clinic_zone = ZoneInfo(workspace.timezone)
+            except Exception as exc:
+                results.append(_result(tool_call, {"success": False, "code": "INVALID_CLINIC_TIMEZONE", "message": str(exc)}))
+                continue
+            start_time = datetime.combine(
+                args.preferred_date, args.preferred_time, tzinfo=clinic_zone
+            )
+            provider = scheduling.resolve_provider(
+                workspace.id, provider_name=args.provider_name
+            )
+            if provider is None:
+                provider = _first_free_provider(db, scheduling, workspace, service, start_time)
+            if provider is None:
+                results.append(
+                    _result(
+                        tool_call,
+                        {
+                            "success": False,
+                            "code": "SLOT_TAKEN",
+                            "message": (
+                                "No doctor is free at that time. Check availability again "
+                                "and offer the caller the times that come back."
+                            ),
+                        },
+                    )
+                )
+                continue
 
         note = f"Booked via Vapi ({service.name})"
         if args.reason:
@@ -431,7 +513,7 @@ def book_appointment(
                     workspace=workspace,
                     service=service,
                     provider=provider,
-                    start_time=token.start_time,
+                    start_time=start_time,
                     patient_name=args.patient_name,
                     patient_phone=patient_phone,
                     patient_email=str(args.patient_email) if args.patient_email else None,

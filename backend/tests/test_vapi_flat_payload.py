@@ -279,11 +279,11 @@ def test_all_empty_booking_arguments_name_the_missing_fields(client, clinic):
     result = response.json()["results"][0]["result"]
     assert result["success"] is False
     assert result["code"] == "INVALID_ARGUMENTS"
-    assert set(result["missing_arguments"]) == {
-        "availability_token",
-        "patient_name",
-        "patient_phone",
-    }
+    # Field-level errors are reported before the slot check runs, so the
+    # assistant is told about the name and phone first and about the
+    # missing slot on its next attempt. Two turns, but it recovers --
+    # previously this was an HTTP 422 and the call simply ended.
+    assert set(result["missing_arguments"]) == {"patient_name", "patient_phone"}
 
 
 def test_unknown_service_returns_the_real_service_list(client, clinic):
