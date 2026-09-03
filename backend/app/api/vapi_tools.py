@@ -24,6 +24,8 @@ from app.integrations.vapi.security import (
     verify_vapi_tool_request,
 )
 from app.models.phone_number import PhoneNumber
+from app.models.provider import Provider
+from app.models.service import Service
 from app.models.workspace import Workspace
 from app.services.phone_numbers import normalize_e164
 from app.schemas.vapi import (
@@ -111,6 +113,26 @@ def _workspace_from_vapi_request(db: Session, payload: VapiToolRequest) -> Works
     raise HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
         detail="No workspace is assigned to this phone number.",
+    )
+
+
+def _active_service_names(db: Session, workspace_id: uuid.UUID) -> list[str]:
+    return list(
+        db.execute(
+            select(Service.name)
+            .where(Service.workspace_id == workspace_id, Service.is_active.is_(True))
+            .order_by(Service.name)
+        ).scalars()
+    )
+
+
+def _active_provider_names(db: Session, workspace_id: uuid.UUID) -> list[str]:
+    return list(
+        db.execute(
+            select(Provider.name)
+            .where(Provider.workspace_id == workspace_id, Provider.is_active.is_(True))
+            .order_by(Provider.name)
+        ).scalars()
     )
 
 
@@ -212,7 +234,26 @@ def check_availability(
             workspace.id, service_id=args.service_id, service_name=args.service_name
         )
         if service is None:
-            results.append(_result(tool_call, {"success": False, "code": "SERVICE_NOT_FOUND", "message": "That clinic service was not found."}))
+            # The assistant has no other way to learn what this clinic
+            # offers, so it guesses, and a caller speaking Urdu makes it
+            # guess in Urdu -- which never matches an English service
+            # name. Returning the real list lets the call recover in one
+            # turn instead of dead-ending in an apology.
+            results.append(
+                _result(
+                    tool_call,
+                    {
+                        "success": False,
+                        "code": "SERVICE_NOT_FOUND",
+                        "message": (
+                            "That service was not found. Read the available services to "
+                            "the caller, ask which one they need, and check again using "
+                            "the name exactly as listed."
+                        ),
+                        "available_services": _active_service_names(db, workspace.id),
+                    },
+                )
+            )
             continue
 
         provider_requested = args.provider_id is not None or args.provider_name is not None
@@ -222,7 +263,20 @@ def check_availability(
         if provider_requested and provider is None and (args.provider_name or "").strip().lower() not in {
             "any", "no preference", "no_preference"
         }:
-            results.append(_result(tool_call, {"success": False, "code": "PROVIDER_NOT_FOUND", "message": "That provider was not found."}))
+            results.append(
+                _result(
+                    tool_call,
+                    {
+                        "success": False,
+                        "code": "PROVIDER_NOT_FOUND",
+                        "message": (
+                            "That doctor was not found. Read the available doctors to the "
+                            "caller, or omit the doctor entirely if they have no preference."
+                        ),
+                        "available_providers": _active_provider_names(db, workspace.id),
+                    },
+                )
+            )
             continue
 
         try:
