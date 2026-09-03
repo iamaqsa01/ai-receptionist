@@ -39,6 +39,48 @@ def _blank_to_none(value: Any) -> Any:
 FLAT_TOOL_CALL_NAME = "vapi_flat_body"
 
 
+# A caller says "morning", never "09:00". The schema wanted HH:MM and
+# rejected the whole request, which reaches Vapi as no tool result.
+_TIME_WORDS = {
+    "early morning": "08:00",
+    "morning": "09:00",
+    "late morning": "11:00",
+    "noon": "12:00",
+    "midday": "12:00",
+    "lunchtime": "12:00",
+    "early afternoon": "13:00",
+    "afternoon": "13:00",
+    "late afternoon": "16:00",
+    "evening": "17:00",
+    "night": "19:00",
+    "subah": "09:00",
+    "dopahar": "13:00",
+    "sham": "17:00",
+    "shaam": "17:00",
+    "raat": "19:00",
+}
+
+
+def _coerce_time(value: Any) -> Any:
+    """Map a spoken time-of-day onto a clock time, or drop it entirely.
+
+    An unreadable time means "no preference", which returns the day's
+    slots and lets the caller choose. Failing the request instead told
+    the assistant nothing and ended the booking.
+    """
+    value = _blank_to_none(value)
+    if not isinstance(value, str):
+        return value
+    key = value.strip().lower()
+    if key in _TIME_WORDS:
+        return _TIME_WORDS[key]
+    try:
+        time.fromisoformat(key)
+    except ValueError:
+        return None
+    return key
+
+
 def _direct_tool_call_id(tool_name: str, arguments: dict[str, Any]) -> str:
     """Stable per-invocation id for a flat-body tool call.
 
@@ -143,6 +185,11 @@ class VapiToolRequest(BaseModel):
     def blank_optional_is_none(cls, value: Any) -> Any:
         return _blank_to_none(value)
 
+    @field_validator("preferred_time", mode="before")
+    @classmethod
+    def spoken_time_is_a_clock_time(cls, value: Any) -> Any:
+        return _coerce_time(value)
+
     _ROUTING_FIELDS = {"called_number", "caller_number", "vapi_call_id"}
 
     @model_validator(mode="after")
@@ -227,6 +274,11 @@ class CheckAvailabilityArguments(BaseModel):
     def blank_optional_is_none(cls, value: Any) -> Any:
         return _blank_to_none(value)
 
+    @field_validator("preferred_time", mode="before")
+    @classmethod
+    def spoken_time_is_a_clock_time(cls, value: Any) -> Any:
+        return _coerce_time(value)
+
     @model_validator(mode="after")
     def require_service_identity(self) -> "CheckAvailabilityArguments":
         if self.service_id is None and self.service_name is None:
@@ -235,16 +287,53 @@ class CheckAvailabilityArguments(BaseModel):
 
 
 class BookAppointmentArguments(BaseModel):
-    availability_token: str = Field(min_length=1, max_length=4096)
+    # The token identifies the exact slot the caller chose and is still
+    # preferred. It is a ~300 character JWT the assistant must copy back
+    # verbatim, and in production it routinely arrives empty: the model
+    # reads the slots aloud, then sends "" and the booking dies. So the
+    # slot can also be named the way the caller named it, by date and
+    # time. Nothing is trusted either way -- business hours, conflicts
+    # and past times are all re-checked before anything is written.
+    availability_token: str | None = Field(default=None, max_length=4096)
+    service_id: uuid.UUID | None = None
+    service_name: str | None = Field(default=None, max_length=255)
+    provider_name: str | None = Field(default=None, max_length=255)
+    preferred_date: date | None = None
+    preferred_time: time | None = None
     patient_name: str = Field(min_length=2, max_length=120)
     patient_phone: str = Field(min_length=5, max_length=32)
     patient_email: EmailStr | None = None
     reason: str | None = Field(default=None, max_length=1000)
 
-    @field_validator("patient_email", "reason", mode="before")
+    @field_validator(
+        "availability_token",
+        "service_name",
+        "provider_name",
+        "patient_email",
+        "reason",
+        mode="before",
+    )
     @classmethod
     def blank_optional_is_none(cls, value: Any) -> Any:
         return _blank_to_none(value)
+
+    @field_validator("preferred_time", mode="before")
+    @classmethod
+    def spoken_time_is_a_clock_time(cls, value: Any) -> Any:
+        return _coerce_time(value)
+
+    @model_validator(mode="after")
+    def require_a_slot(self) -> "BookAppointmentArguments":
+        if self.availability_token:
+            return self
+        if self.preferred_date and self.preferred_time is not None and (
+            self.service_id or self.service_name
+        ):
+            return self
+        raise ValueError(
+            "availability_token is required, or else service_name with "
+            "preferred_date and preferred_time"
+        )
 
 
 class VapiToolResult(BaseModel):
