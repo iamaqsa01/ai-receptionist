@@ -128,6 +128,17 @@ class AppointmentSchedulingService:
     ) -> AvailabilitySearchResult:
         tz = self._workspace_timezone(workspace)
         result = AvailabilitySearchResult(workspace=workspace, service=service, timezone=workspace.timezone)
+        # A voice model asked for "the 6th of October" will happily emit a
+        # year from its training data. Silently returning no slots reads
+        # to the assistant as a full diary, so it apologises instead of
+        # asking the caller which year they meant.
+        if preferred_date < datetime.now(tz).date():
+            result.code = "DATE_IN_THE_PAST"
+            result.message = (
+                "That date has already passed. Confirm the day, month and year "
+                "with the caller and check again."
+            )
+            return result
         hours = self._business_hours(workspace.id, preferred_date.weekday())
         if hours is None:
             result.code = "BUSINESS_HOURS_NOT_CONFIGURED"
