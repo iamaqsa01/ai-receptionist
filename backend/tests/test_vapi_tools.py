@@ -9,6 +9,7 @@ from app.models.appointment import Appointment
 from app.models.business_hours import BusinessHours
 from app.models.integration import Integration
 from app.models.patient import Patient
+from app.models.phone_number import PhoneNumber
 from app.models.provider import Provider
 from app.models.service import Service
 from app.models.workspace import Workspace
@@ -241,3 +242,211 @@ def test_vapi_booking_rechecks_and_rejects_slot_conflict(client, db_session, cli
     result = response.json()["results"][0]["result"]
     assert result["success"] is False
     assert result["code"] == "SLOT_TAKEN"
+
+
+# ---------------------------------------------------------------------------
+# Dynamic phone-number -> workspace routing (/integrations/vapi/tools/...)
+# ---------------------------------------------------------------------------
+# These routes resolve the workspace from the call's dialed/caller number
+# instead of taking it in the URL. The Vapi webhook authentication that
+# guards the explicit per-workspace routes MUST guard these too.
+
+DYNAMIC_AVAILABILITY_URL = "/api/v1/integrations/vapi/tools/check-availability"
+DYNAMIC_BOOKING_URL = "/api/v1/integrations/vapi/tools/book-appointment"
+
+
+def _second_clinic(db_session, preferred_date):
+    workspace = Workspace(name="Second Clinic", slug=f"vapi-{uuid.uuid4().hex}", timezone="UTC")
+    db_session.add(workspace)
+    db_session.flush()
+    service = Service(
+        workspace_id=workspace.id, name="Second Consultation", duration_minutes=30, is_active=True
+    )
+    provider = Provider(workspace_id=workspace.id, name="Dr. Chen", is_active=True)
+    db_session.add_all([service, provider])
+    db_session.add(
+        BusinessHours(
+            workspace_id=workspace.id,
+            day_of_week=preferred_date.weekday(),
+            open_time=time(9, 0),
+            close_time=time(17, 0),
+            is_closed=False,
+        )
+    )
+    db_session.add(
+        Integration(
+            workspace_id=workspace.id,
+            provider="google_calendar",
+            is_active=True,
+            config={"calendar_id": f"{workspace.id}@example.com"},
+        )
+    )
+    db_session.commit()
+    return workspace, service, provider
+
+
+def test_dynamic_route_requires_vapi_authentication(client, db_session, clinic):
+    workspace, service, provider, preferred_date = clinic
+    db_session.add(PhoneNumber(number="+14155550101", workspace_id=workspace.id))
+    db_session.commit()
+    payload = availability_payload(service, provider, preferred_date)
+    payload["call"] = {"id": "call-x", "phoneNumber": {"number": "+14155550101"}}
+
+    response = client.post(DYNAMIC_AVAILABILITY_URL, json=payload)  # no Authorization header
+
+    assert response.status_code == 401
+
+
+def test_dynamic_route_rejects_invalid_vapi_secret(client, db_session, clinic):
+    workspace, service, provider, preferred_date = clinic
+    db_session.add(PhoneNumber(number="+14155550101", workspace_id=workspace.id))
+    db_session.commit()
+    payload = availability_payload(service, provider, preferred_date)
+    payload["call"] = {"id": "call-x", "phoneNumber": {"number": "+14155550101"}}
+
+    response = client.post(DYNAMIC_AVAILABILITY_URL, headers=headers("wrong-secret"), json=payload)
+
+    assert response.status_code == 401
+
+
+def test_dynamic_book_appointment_cannot_be_called_without_vapi_auth(client, db_session, clinic):
+    """Regression: an unauthenticated request must not be able to book."""
+    workspace, service, provider, preferred_date = clinic
+    db_session.add(PhoneNumber(number="+14155550101", workspace_id=workspace.id))
+    db_session.commit()
+    token, _ = get_token(client, clinic)
+    payload = booking_payload(token)
+    payload["call"] = {"id": "call-unauth", "phoneNumber": {"number": "+14155550101"}}
+
+    response = client.post(DYNAMIC_BOOKING_URL, json=payload)  # no Authorization header
+
+    assert response.status_code == 401
+    count = db_session.execute(
+        select(func.count()).select_from(Appointment).where(Appointment.workspace_id == workspace.id)
+    ).scalar_one()
+    assert count == 0
+
+
+def test_dynamic_route_resolves_workspace_from_dialed_number(client, db_session, clinic):
+    workspace, service, provider, preferred_date = clinic
+    db_session.add(PhoneNumber(number="+14155550101", workspace_id=workspace.id))
+    db_session.commit()
+    payload = availability_payload(service, provider, preferred_date)
+    payload["call"] = {
+        "id": "call-dialed",
+        "customer": {"number": "+14155559999"},  # unknown caller number
+        "phoneNumber": {"number": "+1 (415) 555-0101"},  # dialed number, unnormalised
+    }
+
+    response = client.post(DYNAMIC_AVAILABILITY_URL, headers=headers(), json=payload)
+
+    assert response.status_code == 200, response.text
+    result = response.json()["results"][0]["result"]
+    assert result["success"] is True
+    assert result["service"]["name"] == "Extended Consultation"
+
+
+def test_dynamic_route_falls_back_to_caller_number(client, db_session, clinic):
+    workspace, service, provider, preferred_date = clinic
+    db_session.add(PhoneNumber(number="+14155550101", workspace_id=workspace.id))
+    db_session.commit()
+    payload = availability_payload(service, provider, preferred_date)
+    payload["call"] = {
+        "id": "call-caller-fallback",
+        "customer": {"number": "+14155550101"},  # only the caller number matches
+    }
+
+    response = client.post(DYNAMIC_AVAILABILITY_URL, headers=headers(), json=payload)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["results"][0]["result"]["success"] is True
+
+
+def test_dynamic_route_unknown_number_returns_404(client, db_session, clinic):
+    _, service, provider, preferred_date = clinic  # no PhoneNumber row created
+    payload = availability_payload(service, provider, preferred_date)
+    payload["call"] = {"id": "call-unknown", "phoneNumber": {"number": "+14155550199"}}
+
+    response = client.post(DYNAMIC_AVAILABILITY_URL, headers=headers(), json=payload)
+
+    assert response.status_code == 404
+
+
+def test_dynamic_route_missing_number_returns_400(client, db_session, clinic):
+    _, service, provider, preferred_date = clinic
+    payload = availability_payload(service, provider, preferred_date)
+    payload["call"] = {"id": "call-no-number"}
+
+    response = client.post(DYNAMIC_AVAILABILITY_URL, headers=headers(), json=payload)
+
+    assert response.status_code == 400
+
+
+def test_dynamic_routes_route_each_number_to_its_own_workspace(client, db_session, clinic):
+    first_workspace, first_service, first_provider, preferred_date = clinic
+    second_workspace, second_service, second_provider = _second_clinic(db_session, preferred_date)
+    db_session.add_all(
+        [
+            PhoneNumber(number="+14155550101", workspace_id=first_workspace.id),
+            PhoneNumber(number="+14155550102", workspace_id=second_workspace.id),
+        ]
+    )
+    db_session.commit()
+
+    first_payload = availability_payload(first_service, first_provider, preferred_date, tool_call_id="first")
+    first_payload["call"] = {"id": "call-first", "phoneNumber": {"number": "+14155550101"}}
+    second_payload = availability_payload(second_service, second_provider, preferred_date, tool_call_id="second")
+    second_payload["call"] = {"id": "call-second", "phoneNumber": {"number": "+14155550102"}}
+
+    first_response = client.post(DYNAMIC_AVAILABILITY_URL, headers=headers(), json=first_payload)
+    second_response = client.post(DYNAMIC_AVAILABILITY_URL, headers=headers(), json=second_payload)
+
+    assert first_response.status_code == 200, first_response.text
+    assert second_response.status_code == 200, second_response.text
+    first_result = first_response.json()["results"][0]["result"]
+    second_result = second_response.json()["results"][0]["result"]
+    assert first_result["service"]["name"] == "Extended Consultation"
+    assert second_result["service"]["name"] == "Second Consultation"
+
+    # A booking placed through the dynamic route lands in the routed workspace.
+    booking = booking_payload(second_result["available_slots"][0]["availability_token"], phone="+14155550200")
+    booking["call"] = {"id": "call-second-booking", "phoneNumber": {"number": "+14155550102"}}
+    booking_response = client.post(DYNAMIC_BOOKING_URL, headers=headers(), json=booking)
+
+    assert booking_response.status_code == 200, booking_response.text
+    assert booking_response.json()["results"][0]["result"]["success"] is True
+    appointment = db_session.execute(
+        select(Appointment).where(Appointment.workspace_id == second_workspace.id)
+    ).scalar_one()
+    assert appointment.service_id == second_service.id
+    assert (
+        db_session.execute(
+            select(func.count()).select_from(Appointment).where(Appointment.workspace_id == first_workspace.id)
+        ).scalar_one()
+        == 0
+    )
+
+
+def test_dynamic_route_cannot_be_used_to_book_into_another_workspace(client, db_session, clinic):
+    """The availability token is workspace-bound: a token minted for clinic A
+    cannot be redeemed on a call that routes (by phone number) to clinic B."""
+    first_workspace, first_service, first_provider, preferred_date = clinic
+    second_workspace, _, _ = _second_clinic(db_session, preferred_date)
+    db_session.add_all(
+        [
+            PhoneNumber(number="+14155550101", workspace_id=first_workspace.id),
+            PhoneNumber(number="+14155550102", workspace_id=second_workspace.id),
+        ]
+    )
+    db_session.commit()
+
+    token, _ = get_token(client, clinic)  # token for clinic A
+    booking = booking_payload(token, phone="+14155550200")
+    booking["call"] = {"id": "cross", "phoneNumber": {"number": "+14155550102"}}  # routes to clinic B
+
+    response = client.post(DYNAMIC_BOOKING_URL, headers=headers(), json=booking)
+
+    assert response.status_code == 200, response.text
+    result = response.json()["results"][0]["result"]
+    assert result["success"] is False
+    assert result["code"] == "INVALID_AVAILABILITY_TOKEN"

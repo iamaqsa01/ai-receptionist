@@ -1,9 +1,11 @@
+import logging
 import uuid
 from datetime import timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import ValidationError
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.ai.qualification.validators import validate_name, validate_phone
@@ -14,7 +16,9 @@ from app.integrations.vapi.security import (
     decode_availability_token,
     verify_vapi_tool_request,
 )
+from app.models.phone_number import PhoneNumber
 from app.models.workspace import Workspace
+from app.services.phone_numbers import normalize_e164
 from app.schemas.vapi import (
     BookAppointmentArguments,
     CheckAvailabilityArguments,
@@ -25,8 +29,20 @@ from app.schemas.vapi import (
 )
 from app.services.scheduling import AppointmentBookingRequest, AppointmentSchedulingService
 
+logger = logging.getLogger(__name__)
+
+# Explicit per-workspace routes: the workspace is named in the URL.
 router = APIRouter(
     prefix="/integrations/vapi/workspaces/{workspace_id}/tools",
+    tags=["vapi-tools"],
+    dependencies=[Depends(verify_vapi_tool_request)],
+)
+
+# Dynamic routes: the workspace is resolved from the call's phone number.
+# Same Vapi authentication as the explicit routes — an unauthenticated or
+# wrongly-signed request never reaches availability or booking.
+dynamic_router = APIRouter(
+    prefix="/integrations/vapi/tools",
     tags=["vapi-tools"],
     dependencies=[Depends(verify_vapi_tool_request)],
 )
@@ -52,6 +68,43 @@ def _workspace_or_404(db: Session, workspace_id: uuid.UUID) -> Workspace:
     if workspace is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
     return workspace
+
+
+def _workspace_from_vapi_request(db: Session, payload: VapiToolRequest) -> Workspace:
+    """Resolve the workspace for a dynamic-routed Vapi call from its phone number.
+
+    The dialed number decides the workspace; the caller's number is only a
+    fallback (see ``VapiToolRequest.routing_phone_numbers``). The caller can
+    never supply a ``workspace_id`` on this path.
+    """
+    candidates = [normalize_e164(number) for number in payload.routing_phone_numbers]
+    candidates = [number for number in candidates if number]
+    if not candidates:
+        logger.info("vapi dynamic routing: request carried no usable phone number")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The Vapi call phone number is required for routing.",
+        )
+
+    for number in candidates:
+        phone_number = db.execute(
+            select(PhoneNumber).where(PhoneNumber.number == number)
+        ).scalar_one_or_none()
+        if phone_number is not None:
+            workspace = _workspace_or_404(db, phone_number.workspace_id)
+            logger.info(
+                "vapi dynamic routing: resolved workspace %s", workspace.id
+            )
+            return workspace
+
+    logger.info(
+        "vapi dynamic routing: no workspace assigned to any candidate number (%d tried)",
+        len(candidates),
+    )
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="No workspace is assigned to this phone number.",
+    )
 
 
 @router.post("/check-availability", response_model=VapiToolResponse)
@@ -248,3 +301,40 @@ def book_appointment(
         )
 
     return VapiToolResponse(results=results)
+
+
+@dynamic_router.post("/check-availability", response_model=VapiToolResponse)
+def check_availability_for_vapi_number(
+    payload: VapiToolRequest,
+    db: Session = Depends(get_db),
+) -> VapiToolResponse:
+    """Phone-number-routed availability check.
+
+    Vapi is authenticated by the router-level dependency; the workspace is
+    then resolved from the dialed/caller number before the same business
+    logic as the explicit per-workspace route runs.
+    """
+    workspace = _workspace_from_vapi_request(db, payload)
+    response = check_availability(workspace.id, payload, db)
+    logger.info(
+        "vapi dynamic check-availability complete for workspace %s: %d result(s)",
+        workspace.id,
+        len(response.results),
+    )
+    return response
+
+
+@dynamic_router.post("/book-appointment", response_model=VapiToolResponse)
+def book_appointment_for_vapi_number(
+    payload: VapiToolRequest,
+    db: Session = Depends(get_db),
+) -> VapiToolResponse:
+    """Phone-number-routed booking. Same auth + routing as the check above."""
+    workspace = _workspace_from_vapi_request(db, payload)
+    response = book_appointment(workspace.id, payload, db)
+    logger.info(
+        "vapi dynamic book-appointment complete for workspace %s: %d result(s)",
+        workspace.id,
+        len(response.results),
+    )
+    return response

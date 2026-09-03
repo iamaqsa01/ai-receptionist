@@ -320,6 +320,19 @@ const Api = (() => {
     },
   };
 
+  // -- Phone numbers -> workspace routing --------------------------------------
+  const phoneNumbers = {
+    async list() {
+      return request(workspacePath("/phone-numbers"));
+    },
+    async add(number) {
+      return request(workspacePath("/phone-numbers"), { method: "POST", body: { number } });
+    },
+    async remove(id) {
+      return request(workspacePath(`/phone-numbers/${id}`), { method: "DELETE" });
+    },
+  };
+
   // -- Calls + transcripts --------------------------------------------------------
   const calls = {
     async list() {
@@ -398,6 +411,6 @@ const Api = (() => {
     getWorkspaceId, setWorkspaceId, clearWorkspaceId,
     getBranchModel, setBranchModel, clearBranchModel,
     auth, workspaces, clinicSettings, leads, patients, appointments, providers, services,
-    calls, handoffs, notificationMessages, ai, health, analytics, integrations,
+    phoneNumbers, calls, handoffs, notificationMessages, ai, health, analytics, integrations,
   };
 })();

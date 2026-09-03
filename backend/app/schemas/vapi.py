@@ -5,10 +5,21 @@ import uuid
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
 
-class VapiCall(BaseModel):
-    id: str = Field(min_length=1, max_length=255)
+class VapiPhoneNumber(BaseModel):
+    number: str = Field(min_length=1, max_length=32)
 
     model_config = ConfigDict(extra="ignore")
+
+
+class VapiCall(BaseModel):
+    id: str = Field(min_length=1, max_length=255)
+    # The number the caller dialed (`phoneNumber`) and the caller's own
+    # number (`customer`). Used only to route the call to a workspace; the
+    # caller can never name a workspace directly.
+    customer: VapiPhoneNumber | None = None
+    phone_number: VapiPhoneNumber | None = Field(default=None, alias="phoneNumber")
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
 
 class VapiToolCall(BaseModel):
@@ -45,6 +56,24 @@ class VapiToolRequest(BaseModel):
     def call_id(self) -> str | None:
         call = self.call or self.message.call
         return call.id if call else None
+
+    @property
+    def routing_phone_numbers(self) -> list[str]:
+        """Numbers to try for phone -> workspace routing.
+
+        Dialed number first (the clinic's own line), caller number second as
+        a fallback. Order matters: the dialed number is what identifies the
+        workspace; the caller number is only a last resort.
+        """
+        calls = [self.call, self.message.call]
+        numbers: list[str] = []
+        for call in calls:
+            if call is None:
+                continue
+            for phone in (call.phone_number, call.customer):
+                if phone and phone.number not in numbers:
+                    numbers.append(phone.number)
+        return numbers
 
 
 class CheckAvailabilityArguments(BaseModel):

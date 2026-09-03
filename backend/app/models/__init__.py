@@ -6,6 +6,7 @@ from app.models.user import User
 from app.models.auth_session import AuthSession
 from app.models.workspace import Workspace
 from app.models.workspace_member import WorkspaceMember
+from app.models.phone_number import PhoneNumber
 from app.models.patient import Patient
 from app.models.lead import Lead
 from app.models.provider import Provider
@@ -29,6 +30,7 @@ __all__ = [
     "AuthSession",
     "Workspace",
     "WorkspaceMember",
+    "PhoneNumber",
     "Patient",
     "Lead",
     "Provider",

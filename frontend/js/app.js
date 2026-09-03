@@ -1823,6 +1823,7 @@
     { id: "ai", label: "AI preferences" },
     { id: "context", label: "Business context" },
     { id: "integrations", label: "Integrations" },
+    { id: "phone-numbers", label: "Phone numbers" },
     { id: "team", label: "Team" },
   ];
   const AGENT_TONES = ["Professional", "Empathetic", "Friendly"];
@@ -1863,7 +1864,8 @@
     ({
       business: settingsBusiness, clinic: settingsClinicInfo, scheduling: settingsScheduling,
       emergency: settingsEmergency, ai: settingsAi, context: settingsBusinessContext,
-      integrations: settingsIntegrations, team: settingsTeam,
+      integrations: settingsIntegrations, "phone-numbers": settingsPhoneNumbers,
+      team: settingsTeam,
     }[active] || settingsBusiness)(panel);
   }
 
@@ -2412,6 +2414,91 @@
       skeleton: skeletonRows(3, 1),
       fetcher: () => Api.integrations.googleStatus(),
       render: paint,
+    });
+  }
+
+  // -- Phone numbers -> workspace routing ----------------------------
+  // Each number assigned here routes an inbound AI Receptionist call to
+  // this workspace. Read is open to any member; add/remove is owner/admin
+  // (settings:manage), matched to what the backend enforces.
+  function settingsPhoneNumbers(panel) {
+    const membership = (state.memberships || []).find((m) => m.workspace_id === state.workspace?.id);
+    const canManage = Boolean(state.user?.is_super_admin || ["owner", "admin"].includes(membership?.role));
+
+    loadInto(panel, {
+      skeleton: skeletonRows(3, 1),
+      fetcher: () => Api.phoneNumbers.list(),
+      render: (rows) => {
+        let numbers = Array.isArray(rows) ? rows.slice() : [];
+
+        const paint = () => {
+          const list = numbers.length
+            ? `<div class="table-scroll"><table class="data-table">
+                 <thead><tr><th>Number</th><th>Added</th>${canManage ? "<th></th>" : ""}</tr></thead>
+                 <tbody>${numbers.map((n) => `
+                   <tr>
+                     <td class="cell-primary">${escapeHtml(n.number)}</td>
+                     <td class="cell-muted">${escapeHtml(timeAgo(n.created_at))}</td>
+                     ${canManage ? `<td style="text-align:right;"><button class="btn btn--ghost btn--sm" data-remove="${escapeHtml(n.id)}" aria-label="Remove ${escapeHtml(n.number)}">${ICONS.trash}</button></td>` : ""}
+                   </tr>`).join("")}</tbody>
+               </table></div>`
+            : `<div class="settings-card__desc">No phone numbers are routed to this workspace yet.</div>`;
+
+          panel.innerHTML = settingsCard(
+            "Phone numbers",
+            "Inbound calls to these numbers are answered by this workspace's AI Receptionist.",
+            `${canManage ? `
+              <div class="field" style="display:flex;gap:8px;align-items:flex-start;">
+                <input class="input" id="s-pn-input" type="tel" inputmode="tel" placeholder="+1 415 555 0100" maxlength="32" style="flex:1;" />
+                <button class="btn btn--primary btn--sm" id="s-pn-add"><span class="btn__label">Add</span></button>
+              </div>
+              <div class="field__error" id="s-pn-err" role="alert" hidden></div>
+              <div class="field__hint">Use international format, including the country code (e.g. +14155550100).</div>
+            ` : `<div class="field__hint">Only workspace owners and admins can change phone numbers.</div>`}
+            <div style="margin-top:14px;" id="s-pn-list">${list}</div>`
+          );
+
+          const err = $("#s-pn-err", panel);
+          const showErr = (m) => { if (err) { err.hidden = !m; err.textContent = m || ""; } };
+
+          const addBtn = $("#s-pn-add", panel);
+          if (addBtn) addBtn.addEventListener("click", async () => {
+            const input = $("#s-pn-input", panel);
+            const value = input.value.trim();
+            showErr("");
+            if (!value) { showErr("Enter a phone number."); return; }
+            addBtn.classList.add("is-loading"); addBtn.disabled = true;
+            try {
+              const created = await Api.phoneNumbers.add(value);
+              numbers.push(created);
+              toast({ title: "Phone number added", tone: "success" });
+              paint();
+            } catch (e) {
+              showErr(e instanceof Api.ApiError ? e.message : (e.message || "Couldn't add that number."));
+            } finally {
+              addBtn.classList.remove("is-loading"); addBtn.disabled = false;
+            }
+          });
+
+          $$("[data-remove]", panel).forEach((b) => b.addEventListener("click", async () => {
+            const id = b.dataset.remove;
+            const target = numbers.find((n) => n.id === id);
+            if (!window.confirm(`Stop routing ${target ? target.number : "this number"} to this workspace?`)) return;
+            b.disabled = true;
+            try {
+              await Api.phoneNumbers.remove(id);
+              numbers = numbers.filter((n) => n.id !== id);
+              toast({ title: "Phone number removed", tone: "info" });
+              paint();
+            } catch (e) {
+              b.disabled = false;
+              toast({ title: "Couldn't remove", text: e.message || "Try again.", tone: "error" });
+            }
+          }));
+        };
+
+        paint();
+      },
     });
   }
 

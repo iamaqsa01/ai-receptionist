@@ -19,6 +19,7 @@ from app.models import (
     Notification,
     NotificationMessage,
     Patient,
+    PhoneNumber,
     Provider,
     Service,
     User,
@@ -31,6 +32,7 @@ EXPECTED_TABLES = {
     "auth_sessions",
     "workspaces",
     "workspace_members",
+    "phone_numbers",
     "patients",
     "leads",
     "calls",
@@ -51,6 +53,7 @@ EXPECTED_TABLES = {
 
 TENANT_OWNED_MODELS = [
     WorkspaceMember,
+    PhoneNumber,
     Patient,
     Lead,
     Provider,
