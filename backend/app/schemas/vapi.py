@@ -102,7 +102,17 @@ class VapiToolRequest(BaseModel):
     patient_email: EmailStr | None = None
     reason: str | None = None
 
-    model_config = ConfigDict(extra="ignore")
+    # Routing identity for a flat body, supplied by Vapi's Static Body
+    # Fields ({{phoneNumber.number}}, {{customer.number}}, {{call.id}}).
+    # These are server-trusted: Vapi fills them from call signalling, so
+    # unlike a tool argument the model cannot choose which clinic a
+    # request routes to. Without them a flat body carries no call object
+    # and phone-number routing has nothing to resolve a workspace from.
+    called_number: str | None = None
+    caller_number: str | None = None
+    vapi_call_id: str | None = Field(default=None, alias="call_id")
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
     @field_validator(
         "service_id",
@@ -117,17 +127,36 @@ class VapiToolRequest(BaseModel):
         "patient_phone",
         "patient_email",
         "reason",
+        "called_number",
+        "caller_number",
+        "vapi_call_id",
         mode="before",
     )
     @classmethod
     def blank_optional_is_none(cls, value: Any) -> Any:
         return _blank_to_none(value)
 
+    _ROUTING_FIELDS = {"called_number", "caller_number", "vapi_call_id"}
+
     @model_validator(mode="after")
     def require_tool_calls_message(self) -> "VapiToolRequest":
+        if self.call is None and (
+            self.called_number or self.caller_number or self.vapi_call_id
+        ):
+            self.call = VapiCall(
+                id=self.vapi_call_id or "vapi-static-body",
+                phoneNumber=(
+                    VapiPhoneNumber(number=self.called_number) if self.called_number else None
+                ),
+                customer=(
+                    VapiPhoneNumber(number=self.caller_number) if self.caller_number else None
+                ),
+            )
         if self.message is None:
             arguments = self.model_dump(
-                mode="json", exclude_none=True, exclude={"message", "call"}
+                mode="json",
+                exclude_none=True,
+                exclude={"message", "call"} | self._ROUTING_FIELDS,
             )
             if not arguments:
                 raise ValueError("message is required when no tool arguments are supplied")
