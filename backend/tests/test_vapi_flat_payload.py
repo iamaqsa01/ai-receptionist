@@ -249,3 +249,41 @@ def test_empty_body_is_still_rejected(client, clinic):
     workspace = clinic[0]
     response = post(client, workspace, "check-availability", {})
     assert response.status_code == 422
+
+
+def test_unknown_service_returns_the_real_service_list(client, clinic):
+    """A caller speaking Urdu makes the assistant guess in Urdu.
+
+    "جنرل چیک اپ" can never equal "General Check Up", so the assistant
+    needs to be told what this clinic actually offers.
+    """
+    workspace = clinic[0]
+    response = post(
+        client,
+        workspace,
+        "check-availability",
+        {"service_name": "جنرل چیک اپ", "preferred_date": clinic[3].isoformat()},
+    )
+    assert response.status_code == 200, response.text
+    result = response.json()["results"][0]["result"]
+    assert result["success"] is False
+    assert result["code"] == "SERVICE_NOT_FOUND"
+    assert result["available_services"] == ["General Check Up"]
+
+
+def test_unknown_provider_returns_the_real_provider_list(client, clinic):
+    workspace = clinic[0]
+    response = post(
+        client,
+        workspace,
+        "check-availability",
+        {
+            "service_name": "General Check Up",
+            "provider_name": "Dr. Nobody",
+            "preferred_date": clinic[3].isoformat(),
+        },
+    )
+    assert response.status_code == 200, response.text
+    result = response.json()["results"][0]["result"]
+    assert result["code"] == "PROVIDER_NOT_FOUND"
+    assert result["available_providers"] == ["Dr. Ahmed"]
